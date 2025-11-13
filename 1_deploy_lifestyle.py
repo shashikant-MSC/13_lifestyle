@@ -1,6 +1,8 @@
 import asyncio
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import io
+import json
 import math
 import os
 import tempfile
@@ -15,7 +17,6 @@ from botocore.exceptions import ClientError
 from dotenv import load_dotenv
 import numpy as np
 from openai import OpenAI
-import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
@@ -117,7 +118,8 @@ S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
 S3_BASE_PREFIX = os.environ.get("S3_BASE_PREFIX", "lifestyle-app")
 S3_INPUT_PREFIX = f"{S3_BASE_PREFIX}/inputs"
 S3_OUTPUT_PREFIX = f"{S3_BASE_PREFIX}/outputs"
-S3_EXCEL_KEY = f"{S3_BASE_PREFIX}/logs/lifestyle_llm_eval.xlsx"
+LOG_RUNS_PREFIX = os.environ.get("S3_LOG_RUNS_PREFIX", f"{S3_BASE_PREFIX}/logs/runs")
+LOG_FEEDBACK_PREFIX = os.environ.get("S3_LOG_FEEDBACK_PREFIX", f"{S3_BASE_PREFIX}/logs/feedback")
 
 if not S3_BUCKET_NAME:
     raise ValueError("S3_BUCKET_NAME must be set for storage.")
@@ -234,26 +236,6 @@ EXCEL_HEADERS = [
     "Image Quality (resolution)",
 ]
 
-
-def create_excel_template(path: Path) -> None:
-    wb = Workbook()
-    ws = wb.active
-    ws.append(EXCEL_HEADERS)
-    wb.save(path)
-
-
-def download_excel_from_s3() -> Path:
-    tmp_path = Path(tempfile.gettempdir()) / f"lifestyle_log_{uuid.uuid4().hex}.xlsx"
-    if download_s3_file(S3_EXCEL_KEY, tmp_path):
-        return tmp_path
-    create_excel_template(tmp_path)
-    s3_client.upload_file(str(tmp_path), S3_BUCKET_NAME, S3_EXCEL_KEY)
-    return tmp_path
-
-
-def upload_excel_to_s3(path: Path) -> None:
-    s3_client.upload_file(str(path), S3_BUCKET_NAME, S3_EXCEL_KEY)
-
 MAIN_PROMPT = """
 You are an expert Lifestyle Content Strategist, Visual Storyteller, and Lifestyle Visual Director specializing in authentic, aspirational, and emotionally transformative content. Your mission is to create a single, high-quality, realistic lifestyle image that visually communicates emotional transformation, aspirational living, and lifestyle storytelling based on the provided input image, its description, and category.
 
@@ -266,7 +248,7 @@ Note to be followed strictly-(
 3-The image should be 100 percent right as in real world(earphone bud should be properly fixed in ears,no extra wire)
 4-Product should not change(any minute deatils should not change like logo,design,color,size(watch dial size should not be enlarged)))
 STRICT VISUAL INTEGRITY RULES:
-- The reference subject (product or person) must remain 100% unchanged: no alteration in color, logo, texture, proportions, design, or minute detail.
+- The reference subject (product or person) must remain 100 % unchanged: no alteration in color, logo, texture, proportions, design, or minute detail.
 - The product must be fully visible and unobstructed — not cropped, cut, or partially hidden.
 - If a person is present, show the full person naturally integrated and uncropped.
 - The scene and environment must adapt to the subject; the product itself must never adapt or be modified.
@@ -630,23 +612,21 @@ categories_list = [
 ]
 
 
-def ensure_excel() -> None:
-    tmp = download_excel_from_s3()
-    tmp.unlink(missing_ok=True)
-
-
 def log_entry(entry: List[Any]) -> None:
-    ensure_excel()
-    tmp = download_excel_from_s3()
-    entry = list(entry)
-    while len(entry) < len(EXCEL_HEADERS):
-        entry.append(None)
-    wb = load_workbook(tmp)
-    ws = wb.active
-    ws.append(entry[:len(EXCEL_HEADERS)])
-    wb.save(tmp)
-    upload_excel_to_s3(tmp)
-    tmp.unlink(missing_ok=True)
+    row = list(entry)
+    while len(row) < len(EXCEL_HEADERS):
+        row.append(None)
+    row = row[: len(EXCEL_HEADERS)]
+    payload = dict(zip(EXCEL_HEADERS, row))
+    ts = str(payload.get("Timestamp") or datetime.now(ZoneInfo("UTC")).isoformat())
+    safe_ts = ts.replace(" ", "_").replace(":", "-")
+    key = f"{LOG_RUNS_PREFIX.rstrip('/')}/{safe_ts}_{uuid.uuid4().hex}.json"
+    s3_client.put_object(
+        Bucket=S3_BUCKET_NAME,
+        Key=key,
+        Body=json.dumps(payload, default=str).encode("utf-8"),
+        ContentType="application/json",
+    )
 
 
 def upload_image_to_s3(image_path: Path, key_prefix: str) -> Tuple[Optional[str], Optional[str]]:
@@ -929,14 +909,14 @@ def ensure_aspect_ratio_bounds(
     canvas.paste(image.convert("RGB"), (offset_x, offset_y))
     return canvas, True
 
-def save_input_image(image: Optional[Image.Image], ts: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+def save_input_image(image: Optional[Image.Image], ts: str) -> Tuple[Optional[str], Optional[str]]:
     if image is None:
-        return None, None, None
+        return None, None
     temp_path = Path(tempfile.gettempdir()) / f"{ts}_input.jpg"
     image.convert("RGB").save(temp_path, format="JPEG", quality=95)
     download_link, view_link = upload_image_to_s3(temp_path, S3_INPUT_PREFIX)
     temp_path.unlink(missing_ok=True)
-    return None, download_link, view_link
+    return download_link, view_link
 
 
 def download_image_from_url(url: str) -> Optional[Image.Image]:
@@ -1122,7 +1102,7 @@ async def generate_all(
     pil_image = to_pil_image(image)
     if pil_image is None:
         return [None] * len(MODELS)
-    _, input_download_link, input_view_link = save_input_image(pil_image, ts)
+    input_download_link, input_view_link = save_input_image(pil_image, ts)
     input_link_display = format_storage_links(input_view_link, input_download_link)
     tasks = [
         generate_for_model(
@@ -1154,46 +1134,38 @@ def generate_sync(
     image: Any,
     output_index: int = 1,
 ) -> List[Optional[Image.Image]]:
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
     try:
-        return loop.run_until_complete(generate_all(category, description, image, output_index))
-    finally:
-        loop.close()
+        return asyncio.run(generate_all(category, description, image, output_index))
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "asyncio.run()" in message or "event loop is already running" in message:
+            def _runner() -> List[Optional[Image.Image]]:
+                return asyncio.run(generate_all(category, description, image, output_index))
+
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_runner)
+                return future.result()
+        raise
 
 
 def handle_feedback(model_id: str, image_index: int, feedback: str, text: str, score: Optional[float]) -> str:
-    ensure_excel()
-    tmp = download_excel_from_s3()
-    df = pd.read_excel(tmp)
-    expected_cols = [
-        "Timestamp",
-        "Category",
-        "Description",
-        "Model Name",
-        "Output Image No",
-        "Thumbs (1=Like,0=Dislike)",
-        "Review",
-        "Score by Human",
-        "Input Image (Link)",
-        "Output Image (Link)",
-        "Inference Speed (img/sec)",
-        "Latency (sec)",
-        "Token Processed (in+out)",
-        "Images Generated",
-        "Image Quality (resolution)",
-    ]
-    df = df.reindex(columns=expected_cols)
-    match = df[(df["Model Name"] == model_id) & (df["Output Image No"] == image_index)]
-    if match.empty:
-        return " No matching entry found."
-    idx = match.index[-1]
-    df.loc[idx, "Thumbs (1=Like,0=Dislike)"] = 1 if feedback == "up" else 0
-    df.loc[idx, "Review"] = text
-    df.loc[idx, "Score by Human"] = score
-    df.to_excel(tmp, index=False)
-    upload_excel_to_s3(tmp)
-    tmp.unlink(missing_ok=True)
+    ts = datetime.now(ZoneInfo("UTC")).isoformat()
+    safe_ts = ts.replace(" ", "_").replace(":", "-")
+    payload = {
+        "timestamp": ts,
+        "model_id": model_id,
+        "image_index": image_index,
+        "feedback": feedback,
+        "review": text,
+        "score": score,
+    }
+    key = f"{LOG_FEEDBACK_PREFIX.rstrip('/')}/{safe_ts}_{model_id}_{uuid.uuid4().hex}.json"
+    s3_client.put_object(
+        Bucket=S3_BUCKET_NAME,
+        Key=key,
+        Body=json.dumps(payload, default=str).encode("utf-8"),
+        ContentType="application/json",
+    )
     return f" Feedback saved for {model_id} (image {image_index})"
 
 
