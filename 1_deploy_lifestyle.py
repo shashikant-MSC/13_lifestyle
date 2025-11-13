@@ -216,12 +216,7 @@ def upload_bytes_to_s3(data: bytes, key: str, content_type: str = "application/o
 
 
 def clamp_prompt_length(prompt: str, max_chars: int = MAX_PROMPT_CHARS) -> str:
-    if max_chars <= 0 or len(prompt) <= max_chars:
-        return prompt
-    suffix = "\n\n[Prompt truncated to fit model limit]"
-    keep = max(0, max_chars - len(suffix))
-    truncated = prompt[:keep].rstrip()
-    return f"{truncated}{suffix}"
+    return prompt
 
 
 EXCEL_HEADERS = [
