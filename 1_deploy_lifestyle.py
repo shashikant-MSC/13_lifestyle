@@ -60,6 +60,7 @@ S3_ALLOW_OBJECT_ACL = _get_env_bool("S3_ALLOW_OBJECT_ACL", True)
 _S3_ACL_SUPPORTED = S3_ALLOW_OBJECT_ACL
 _S3_ACL_WARNED = False
 EXCEL_LOCK = threading.Lock()
+GENERATION_LOCK = threading.Lock()
 
 
 async def run_blocking(func, *args, **kwargs):
@@ -1173,18 +1174,19 @@ def generate_sync(
     image: Any,
     output_index: int = 1,
 ) -> List[Optional[Image.Image]]:
-    try:
-        return asyncio.run(generate_all(category, description, image, output_index))
-    except RuntimeError as exc:
-        message = str(exc).lower()
-        if "asyncio.run()" in message or "event loop is already running" in message:
-            def _runner() -> List[Optional[Image.Image]]:
-                return asyncio.run(generate_all(category, description, image, output_index))
+    with GENERATION_LOCK:
+        try:
+            return asyncio.run(generate_all(category, description, image, output_index))
+        except RuntimeError as exc:
+            message = str(exc).lower()
+            if "asyncio.run()" in message or "event loop is already running" in message:
+                def _runner() -> List[Optional[Image.Image]]:
+                    return asyncio.run(generate_all(category, description, image, output_index))
 
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(_runner)
-                return future.result()
-        raise
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(_runner)
+                    return future.result()
+            raise
 
 
 def handle_feedback(model_id: str, image_index: int, feedback: str, text: str, score: Optional[float]) -> str:
