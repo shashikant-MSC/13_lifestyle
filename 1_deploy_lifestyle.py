@@ -1277,7 +1277,9 @@ def main() -> None:
     generation = st.session_state.get("generation")
     if generation:
         st.markdown("### Reference Preview")
-        st.image(generation["reference_image"], caption="Combined Reference", use_container_width=True)
+        ref_cols = st.columns([1, 2, 1])
+        with ref_cols[1]:
+            st.image(generation["reference_image"], caption="Combined Reference", width=380)
 
         st.markdown("### Model Outputs")
         for model_name, img in zip(MODELS, generation["outputs"]):
@@ -1285,27 +1287,55 @@ def main() -> None:
             if img is None:
                 st.info("No image generated for this model.")
                 continue
-            st.image(img, use_container_width=True)
+
+            col_image, col_react, col_review, col_score, col_save = st.columns([3, 1.2, 3, 1.2, 1])
             review_key = f"review_{model_name}"
             score_key = f"score_{model_name}"
             feedback_key = f"feedback_status_{model_name}"
-            st.text_area("Review", key=review_key, height=80)
-            st.number_input("Score (100)", min_value=0.0, max_value=100.0, step=1.0, key=score_key)
-            btn_cols = st.columns(2)
+            choice_key = f"feedback_choice_{model_name}"
+            if choice_key not in st.session_state:
+                st.session_state[choice_key] = None
 
-            def submit_feedback(feedback_type: str) -> None:
-                review_val = st.session_state.get(review_key, "")
-                score_val = st.session_state.get(score_key)
-                message = handle_feedback(model_name, 1, feedback_type, review_val, score_val)
-                st.session_state[feedback_key] = message
+            with col_image:
+                st.image(img, use_container_width=True)
 
-            if btn_cols[0].button("Thumbs Up", key=f"thumb_up_{model_name}"):
-                submit_feedback("up")
-            if btn_cols[1].button("Thumbs Down", key=f"thumb_down_{model_name}"):
-                submit_feedback("down")
+            with col_react:
+                st.write("Reaction")
+                up_clicked = st.button("👍", key=f"thumb_up_{model_name}")
+                down_clicked = st.button("👎", key=f"thumb_down_{model_name}")
+                if up_clicked:
+                    st.session_state[choice_key] = "up"
+                if down_clicked:
+                    st.session_state[choice_key] = "down"
+                selection = st.session_state.get(choice_key)
+                st.caption(f"Selected: {selection or 'None'}")
 
-            if feedback_key in st.session_state:
-                st.success(st.session_state[feedback_key])
+            with col_review:
+                st.text_area("Review", key=review_key, height=110)
+
+            with col_score:
+                st.number_input(
+                    "Score (0-100)",
+                    min_value=0,
+                    max_value=100,
+                    step=1,
+                    key=score_key,
+                )
+
+            with col_save:
+                save_clicked = st.button("Save", key=f"save_{model_name}")
+                if save_clicked:
+                    selected = st.session_state.get(choice_key)
+                    if not selected:
+                        st.warning("Select 👍 or 👎 first.")
+                    else:
+                        review_val = st.session_state.get(review_key, "")
+                        score_val = st.session_state.get(score_key)
+                        message = handle_feedback(model_name, 1, selected, review_val, score_val)
+                        st.session_state[feedback_key] = message
+
+                if feedback_key in st.session_state:
+                    st.success(st.session_state[feedback_key])
 
 
 if __name__ == "__main__":
