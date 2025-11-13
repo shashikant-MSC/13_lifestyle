@@ -56,6 +56,7 @@ MAX_PROMPT_CHARS = _get_env_int("MAX_PROMPT_CHARS", 32000)
 S3_ALLOW_OBJECT_ACL = _get_env_bool("S3_ALLOW_OBJECT_ACL", True)
 _S3_ACL_SUPPORTED = S3_ALLOW_OBJECT_ACL
 _S3_ACL_WARNED = False
+EXCEL_LOCK = threading.Lock()
 
 
 async def run_blocking(func, *args, **kwargs):
@@ -120,6 +121,7 @@ S3_INPUT_PREFIX = f"{S3_BASE_PREFIX}/inputs"
 S3_OUTPUT_PREFIX = f"{S3_BASE_PREFIX}/outputs"
 LOG_RUNS_PREFIX = os.environ.get("S3_LOG_RUNS_PREFIX", f"{S3_BASE_PREFIX}/logs/runs")
 LOG_FEEDBACK_PREFIX = os.environ.get("S3_LOG_FEEDBACK_PREFIX", f"{S3_BASE_PREFIX}/logs/feedback")
+S3_EXCEL_KEY = os.environ.get("S3_EXCEL_KEY", f"{S3_BASE_PREFIX}/logs/lifestyle_llm_eval.xlsx")
 
 if not S3_BUCKET_NAME:
     raise ValueError("S3_BUCKET_NAME must be set for storage.")
@@ -235,6 +237,39 @@ EXCEL_HEADERS = [
     "Images Generated",
     "Image Quality (resolution)",
 ]
+
+
+def create_excel_template(path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.append(EXCEL_HEADERS)
+    wb.save(path)
+
+
+def download_excel_from_s3() -> Path:
+    tmp_path = Path(tempfile.gettempdir()) / f"lifestyle_log_{uuid.uuid4().hex}.xlsx"
+    if download_s3_file(S3_EXCEL_KEY, tmp_path):
+        return tmp_path
+    create_excel_template(tmp_path)
+    s3_client.upload_file(str(tmp_path), S3_BUCKET_NAME, S3_EXCEL_KEY)
+    return tmp_path
+
+
+def upload_excel_to_s3(path: Path) -> None:
+    s3_client.upload_file(str(path), S3_BUCKET_NAME, S3_EXCEL_KEY)
+
+
+def append_row_to_excel(row: List[Any]) -> None:
+    with EXCEL_LOCK:
+        tmp = download_excel_from_s3()
+        try:
+            wb = load_workbook(tmp)
+            ws = wb.active
+            ws.append(row)
+            wb.save(tmp)
+            upload_excel_to_s3(tmp)
+        finally:
+            tmp.unlink(missing_ok=True)
 
 MAIN_PROMPT = """
 You are an expert Lifestyle Content Strategist, Visual Storyteller, and Lifestyle Visual Director specializing in authentic, aspirational, and emotionally transformative content. Your mission is to create a single, high-quality, realistic lifestyle image that visually communicates emotional transformation, aspirational living, and lifestyle storytelling based on the provided input image, its description, and category.
@@ -627,6 +662,7 @@ def log_entry(entry: List[Any]) -> None:
         Body=json.dumps(payload, default=str).encode("utf-8"),
         ContentType="application/json",
     )
+    append_row_to_excel(row)
 
 
 def upload_image_to_s3(image_path: Path, key_prefix: str) -> Tuple[Optional[str], Optional[str]]:
@@ -1166,6 +1202,41 @@ def handle_feedback(model_id: str, image_index: int, feedback: str, text: str, s
         Body=json.dumps(payload, default=str).encode("utf-8"),
         ContentType="application/json",
     )
+
+    with EXCEL_LOCK:
+        tmp = download_excel_from_s3()
+        try:
+            df = pd.read_excel(tmp)
+            expected_cols = [
+                "Timestamp",
+                "Category",
+                "Description",
+                "Model Name",
+                "Output Image No",
+                "Thumbs (1=Like,0=Dislike)",
+                "Review",
+                "Score by Human",
+                "Input Image (Link)",
+                "Output Image (Link)",
+                "Inference Speed (img/sec)",
+                "Latency (sec)",
+                "Token Processed (in+out)",
+                "Images Generated",
+                "Image Quality (resolution)",
+            ]
+            df = df.reindex(columns=expected_cols)
+            match = df[(df["Model Name"] == model_id) & (df["Output Image No"] == image_index)]
+            if match.empty:
+                return " No matching entry found."
+            idx = match.index[-1]
+            df.loc[idx, "Thumbs (1=Like,0=Dislike)"] = 1 if feedback == "up" else 0
+            df.loc[idx, "Review"] = text
+            df.loc[idx, "Score by Human"] = score
+            df.to_excel(tmp, index=False)
+            upload_excel_to_s3(tmp)
+        finally:
+            tmp.unlink(missing_ok=True)
+
     return f" Feedback saved for {model_id} (image {image_index})"
 
 
