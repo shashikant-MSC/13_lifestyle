@@ -364,47 +364,6 @@ The final image should look real, emotionally resonant, and aspirational — ins
 “This could be me, living fully, naturally, beautifully.”
 
 """
-"""
-MAIN_PROMPT_2 =
-You are an expert Lifestyle Visual Director and Emotional Storyteller using Seedream 4.0’s editing capabilities (addition, deletion, replacement, modification) to create a high-quality, realistic, emotionally transformative lifestyle image. The goal is to integrate the given reference subject (product or person) seamlessly into a believable lifestyle scene that visually expresses aspiration, transformation, and authenticity.
-
-Strict Rules: The product or subject must not be changed, stylized, recolored, resized, cropped, or altered in any form. Keep all logos, labels, and minute details intact. The full product must be visible — no half or cut-off objects. If a person appears, the full person must be visible. The environment must adapt to the product, not the other way around.
-
-Seedream Edit Instructions: Use clear, concise commands — [Addition] to add realistic lifestyle elements, [Deletion] to remove distractions, [Replacement] to swap unnatural elements for emotionally aligned ones, [Modification] to adjust light, tone, or setting without altering the product. When needed, use visual markers (arrows, boxes, doodles) to specify edit locations.
-
-Creative Intent: Transform the image into an emotionally grounded lifestyle moment that tells a story of transformation and belonging. Capture authenticity, warmth, and realism using natural lighting, soft tones, and organic textures. Avoid flat, artificial, or overly saturated visuals.
-
-Lifestyle Framework:
-- Lifestyle Theme: (e.g., Wellness, Adventure, Luxury, Creativity, Sustainability)
-- Primary Message: short inspirational phrase (e.g., “Find Your Calm”, “Adventure Awaits”)
-- Supporting Narrative: micro-story showing emotional transformation through scene or light
-- Emotional Tone: calm, inspired, free, empowered, or connected
-- Aesthetic: cinematic realism, warm tones, natural light, human-centered composition
-- Color Psychology: neutrals & greens for wellness, warm golds & blues for adventure, soft beiges & naturals for sustainability, metallics for luxury
-- Setting Examples: serene home mornings, cozy studio, scenic outdoors, reflective moment
-
-Emotional Storytelling Principles:
-1. Authenticity over perfection — real emotion, not staged scenes.
-2. Emotional storytelling — show transformation subtly through light, posture, and setting.
-3. Aspirational relatability — evoke “this could be me, but better.”
-4. Integrated context — lifestyle feels spontaneous, not commercial.
-5. Human energy — natural gestures, warmth, and expression.
-
-Editing Goals:
-- [Addition] Add contextually relevant lifestyle elements (props, environment, light).
-- [Deletion] Remove unnatural, distracting, or non-aligned objects.
-- [Replacement] Replace unrealistic elements with authentic, thematic ones.
-- [Modification] Adjust lighting, mood, or tone for cinematic emotional realism.
-
-Final Output: One realistic, high-quality lifestyle image that looks editorial and emotionally resonant — authentic, aspirational, and human. Maintain full visual integrity of the product/person. No text, branding, or graphic overlays. Capture emotional transformation through authenticity, light, and storytelling.
-
-Example Format for Use:
-[Addition] Add a soft golden morning light and a ceramic mug beside the product to evoke calm.
-[Deletion] Remove harsh shadows in the background.
-[Replacement] Replace plain wall with a softly lit wooden home interior.
-[Modification] Warm tone slightly to enhance cozy lifestyle atmosphere.
-[Image]
-"""
 
 PROMPT_TEMPLATE = PromptTemplate.from_template(
     "{main_prompt}\\n\\nCategory: {category}\\nDescription: {description}"
@@ -1254,7 +1213,7 @@ def update_status_text(value: str) -> None:
 
 def main() -> None:
     st.set_page_config(page_title="Lifestyle Product Image Generator", layout="wide")
-    st.markdown("#  Lifestyle Product Image Generator & Feedback (Drive Edition)")
+    st.markdown("#  Lifestyle Product Image Generator & Feedback (S3 Storage)")
 
     if "generation" not in st.session_state:
         st.session_state["generation"] = None
