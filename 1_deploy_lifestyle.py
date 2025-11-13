@@ -125,7 +125,7 @@ S3_INPUT_PREFIX = f"{S3_BASE_PREFIX}/inputs"
 S3_OUTPUT_PREFIX = f"{S3_BASE_PREFIX}/outputs"
 LOG_RUNS_PREFIX = os.environ.get("S3_LOG_RUNS_PREFIX", f"{S3_BASE_PREFIX}/logs/runs")
 LOG_FEEDBACK_PREFIX = os.environ.get("S3_LOG_FEEDBACK_PREFIX", f"{S3_BASE_PREFIX}/logs/feedback")
-S3_EXCEL_KEY = os.environ.get("S3_EXCEL_KEY", f"{S3_BASE_PREFIX}/logs/lifestyle_llm_eval.xlsx")
+S3_EXCEL_KEY = os.environ.get("S3_EXCEL_KEY", f"{S3_BASE_PREFIX}/logs/1_lifestyle_llm_eval.xlsx")
 
 if not S3_BUCKET_NAME:
     raise ValueError("S3_BUCKET_NAME must be set for storage.")
@@ -228,8 +228,10 @@ EXCEL_HEADERS = [
     "Thumbs (1=Like,0=Dislike)",
     "Review",
     "Score by Human",
-    "Input Image (Link)",
-    "Output Image (Link)",
+    "Input Image View Link",
+    "Input Image Download Link",
+    "Output Image View Link",
+    "Output Image Download Link",
     "Inference Speed (img/sec)",
     "Latency (sec)",
     "Token Processed (in+out)",
@@ -860,17 +862,6 @@ def build_reference_url(image: Optional[Image.Image], link: Optional[str]) -> Op
     return None
 
 
-def format_storage_links(view_link: Optional[str], download_link: Optional[str]) -> Optional[str]:
-    parts: List[str] = []
-    if view_link:
-        parts.append(f"View: {view_link}")
-    if download_link:
-        parts.append(f"Download: {download_link}")
-    if not parts:
-        return None
-    return "\n".join(parts)
-
-
 def add_reference_to_prompt(prompt: str, reference_url: Optional[str]) -> str:
     if not reference_url:
         return prompt
@@ -1081,7 +1072,7 @@ async def generate_for_model(
     image: Optional[Image.Image],
     ts: str,
     input_download_link: Optional[str],
-    input_link_display: Optional[str],
+    input_view_link: Optional[str],
     output_index: int = 1,
 ) -> Optional[Image.Image]:
     template = PROMPT_TEMPLATE_SEEDREAM if model_name == "seedream-4" else PROMPT_TEMPLATE
@@ -1100,7 +1091,6 @@ async def generate_for_model(
     out_img.save(temp_path)
     out_download_link, out_view_link = upload_image_to_s3(temp_path, S3_OUTPUT_PREFIX)
     temp_path.unlink(missing_ok=True)
-    output_link_display = format_storage_links(out_view_link, out_download_link)
     latency = round(time.perf_counter() - inference_start, 3)
     speed = round(1 / latency, 3) if latency else None
     tokens = len(prompt.split())
@@ -1115,8 +1105,10 @@ async def generate_for_model(
         None,
         None,
         None,
-        input_link_display,
-        output_link_display,
+        input_view_link,
+        input_download_link,
+        out_view_link,
+        out_download_link,
         speed,
         latency,
         tokens,
@@ -1138,7 +1130,6 @@ async def generate_all(
     if pil_image is None:
         return [None] * len(MODELS)
     input_download_link, input_view_link = save_input_image(pil_image, ts)
-    input_link_display = format_storage_links(input_view_link, input_download_link)
     tasks = [
         generate_for_model(
             model,
@@ -1147,7 +1138,7 @@ async def generate_all(
             pil_image,
             ts,
             input_download_link,
-            input_link_display,
+            input_view_link,
             output_index,
         )
         for model in MODELS
@@ -1216,8 +1207,10 @@ def handle_feedback(model_id: str, image_index: int, feedback: str, text: str, s
                 "Thumbs (1=Like,0=Dislike)",
                 "Review",
                 "Score by Human",
-                "Input Image (Link)",
-                "Output Image (Link)",
+                "Input Image View Link",
+                "Input Image Download Link",
+                "Output Image View Link",
+                "Output Image Download Link",
                 "Inference Speed (img/sec)",
                 "Latency (sec)",
                 "Token Processed (in+out)",
