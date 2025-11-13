@@ -1,0 +1,1353 @@
+import asyncio
+import base64
+import io
+import math
+import os
+import tempfile
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
+import boto3
+from botocore.exceptions import ClientError
+from dotenv import load_dotenv
+import numpy as np
+from openai import OpenAI
+import pandas as pd
+import requests
+import streamlit as st
+from PIL import Image
+
+try:
+    from google import genai  # Preferred client API
+    _HAS_GOOGLE_CLIENT = True
+except ImportError:  # Fall back to legacy generative AI module
+    import google.generativeai as genai
+    _HAS_GOOGLE_CLIENT = False
+from langchain_core.prompts import PromptTemplate
+from openpyxl import Workbook, load_workbook
+
+
+load_dotenv()
+
+
+def _get_env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _get_env_int(key: str, default: int) -> int:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(f"[warn] Invalid value for {key} ({raw!r}); using default {default}.")
+        return default
+
+
+MAX_PROMPT_CHARS = _get_env_int("MAX_PROMPT_CHARS", 32000)
+S3_ALLOW_OBJECT_ACL = _get_env_bool("S3_ALLOW_OBJECT_ACL", True)
+_S3_ACL_SUPPORTED = S3_ALLOW_OBJECT_ACL
+_S3_ACL_WARNED = False
+
+
+async def run_blocking(func, *args, **kwargs):
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise ValueError("OPENAI_API_KEY must be set.")
+OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
+
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
+if not GOOGLE_API_KEY:
+    raise ValueError("GOOGLE_API_KEY must be set.")
+
+if _HAS_GOOGLE_CLIENT:
+    gclient = genai.Client(api_key=GOOGLE_API_KEY)
+else:
+    genai.configure(api_key=GOOGLE_API_KEY)
+
+    class _GenAIFallbackClient:
+        """Provide minimal Client(models.generate_content) surface."""
+
+        class _ModelsProxy:
+            def generate_content(self, model: str, contents: List[Any]):
+                generative_model = genai.GenerativeModel(model)
+                return generative_model.generate_content(contents)
+
+        def __init__(self) -> None:
+            self.models = self._ModelsProxy()
+
+    gclient = _GenAIFallbackClient()
+
+ARK_API_KEY = os.environ.get("ARK_API_KEY") or None
+
+SEEDREAM_ENDPOINT = "https://ark.ap-southeast.bytepluses.com/api/v3/images/generate"
+
+try:
+    from byteplussdkarkruntime import Ark as BytePlusArk
+    from byteplussdkarkruntime.types.images.images import SequentialImageGenerationOptions
+except Exception as exc:  # noqa: BLE001
+    BytePlusArk = None
+    SequentialImageGenerationOptions = None
+    if ARK_API_KEY:
+        print("[warn] BytePlus Ark SDK unavailable; falling back to HTTP calls.", exc)
+
+ARK_SDK_CLIENT = None
+if BytePlusArk and ARK_API_KEY:
+    try:
+        ARK_SDK_CLIENT = BytePlusArk(
+            base_url="https://ark.ap-southeast.bytepluses.com/api/v3",
+            api_key=ARK_API_KEY,
+        )
+        print("[info] Seedream SDK client initialized.")
+    except Exception as exc:  # noqa: BLE001
+        ARK_SDK_CLIENT = None
+        print("[warn] Failed to initialize Seedream SDK client; using HTTP fallback:", exc)
+
+AWS_REGION = os.environ.get("AWS_REGION") or boto3.session.Session().region_name or "us-east-1"
+S3_BUCKET_NAME = os.environ.get("S3_BUCKET_NAME")
+S3_BASE_PREFIX = os.environ.get("S3_BASE_PREFIX", "lifestyle-app")
+S3_INPUT_PREFIX = f"{S3_BASE_PREFIX}/inputs"
+S3_OUTPUT_PREFIX = f"{S3_BASE_PREFIX}/outputs"
+S3_EXCEL_KEY = f"{S3_BASE_PREFIX}/logs/lifestyle_llm_eval.xlsx"
+
+if not S3_BUCKET_NAME:
+    raise ValueError("S3_BUCKET_NAME must be set for storage.")
+
+s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+
+def s3_object_url(key: str) -> str:
+    if AWS_REGION == "us-east-1":
+        return f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/{key}"
+    return f"https://{S3_BUCKET_NAME}.s3.{AWS_REGION}.amazonaws.com/{key}"
+
+
+def _acl_not_supported(exc: Exception) -> bool:
+    message = str(exc)
+    if isinstance(exc, ClientError):
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in {"AccessControlListNotSupported", "InvalidRequest"}:
+            return True
+    return "AccessControlListNotSupported" in message or "BucketOwnerEnforced" in message
+
+
+def _maybe_disable_acl(extra_args: Dict[str, Any], exc: Exception) -> bool:
+    global _S3_ACL_SUPPORTED, _S3_ACL_WARNED
+    if not extra_args.get("ACL") or not _S3_ACL_SUPPORTED:
+        return False
+    if not _acl_not_supported(exc):
+        return False
+    extra_args.pop("ACL", None)
+    _S3_ACL_SUPPORTED = False
+    if not _S3_ACL_WARNED:
+        print(
+            "[warn] S3 bucket does not allow object ACLs; retrying uploads without ACL. "
+            "Ensure a bucket policy or presigned URLs grant read access if needed."
+        )
+        _S3_ACL_WARNED = True
+    return True
+
+
+def upload_file_to_s3(local_path: Path, key_prefix: str, content_type: str = "image/jpeg", public: bool = True) -> Optional[str]:
+    key = f"{key_prefix.strip('/')}/{datetime.now(ZoneInfo('UTC')).strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex}{Path(local_path).suffix}"
+    extra_args: Dict[str, Any] = {"ContentType": content_type}
+    if public and _S3_ACL_SUPPORTED:
+        extra_args["ACL"] = "public-read"
+    try:
+        s3_client.upload_file(str(local_path), S3_BUCKET_NAME, key, ExtraArgs=extra_args)
+        return s3_object_url(key)
+    except Exception as exc:  # noqa: BLE001
+        if _maybe_disable_acl(extra_args, exc):
+            try:
+                s3_client.upload_file(str(local_path), S3_BUCKET_NAME, key, ExtraArgs=extra_args)
+                return s3_object_url(key)
+            except Exception as retry_exc:  # noqa: BLE001
+                print("[error] Failed to upload file to S3 even without ACL:", retry_exc)
+                return None
+        print("[error] Failed to upload file to S3:", exc)
+        return None
+
+
+def download_s3_file(key: str, destination: Path) -> bool:
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        s3_client.download_file(S3_BUCKET_NAME, key, str(destination))
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "404":
+            return False
+        raise
+
+
+def upload_bytes_to_s3(data: bytes, key: str, content_type: str = "application/octet-stream", public: bool = True) -> Optional[str]:
+    extra_args: Dict[str, Any] = {"ContentType": content_type}
+    if public and _S3_ACL_SUPPORTED:
+        extra_args["ACL"] = "public-read"
+    try:
+        s3_client.put_object(Bucket=S3_BUCKET_NAME, Key=key, Body=data, **extra_args)
+        return s3_object_url(key)
+    except Exception as exc:  # noqa: BLE001
+        if _maybe_disable_acl(extra_args, exc):
+            try:
+                s3_client.put_object(Bucket=S3_BUCKET_NAME, Key=key, Body=data, **extra_args)
+                return s3_object_url(key)
+            except Exception as retry_exc:  # noqa: BLE001
+                print("[error] Failed to upload bytes to S3 even without ACL:", retry_exc)
+                return None
+        print("[error] Failed to upload bytes to S3:", exc)
+        return None
+
+
+def clamp_prompt_length(prompt: str, max_chars: int = MAX_PROMPT_CHARS) -> str:
+    if max_chars <= 0 or len(prompt) <= max_chars:
+        return prompt
+    suffix = "\n\n[Prompt truncated to fit model limit]"
+    keep = max(0, max_chars - len(suffix))
+    truncated = prompt[:keep].rstrip()
+    return f"{truncated}{suffix}"
+
+
+EXCEL_HEADERS = [
+    "Timestamp",
+    "Category",
+    "Description",
+    "Model Name",
+    "Output Image No",
+    "Thumbs (1=Like,0=Dislike)",
+    "Review",
+    "Score by Human",
+    "Input Image (Link)",
+    "Output Image (Link)",
+    "Inference Speed (img/sec)",
+    "Latency (sec)",
+    "Token Processed (in+out)",
+    "Images Generated",
+    "Image Quality (resolution)",
+]
+
+
+def create_excel_template(path: Path) -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.append(EXCEL_HEADERS)
+    wb.save(path)
+
+
+def download_excel_from_s3() -> Path:
+    tmp_path = Path(tempfile.gettempdir()) / f"lifestyle_log_{uuid.uuid4().hex}.xlsx"
+    if download_s3_file(S3_EXCEL_KEY, tmp_path):
+        return tmp_path
+    create_excel_template(tmp_path)
+    s3_client.upload_file(str(tmp_path), S3_BUCKET_NAME, S3_EXCEL_KEY)
+    return tmp_path
+
+
+def upload_excel_to_s3(path: Path) -> None:
+    s3_client.upload_file(str(path), S3_BUCKET_NAME, S3_EXCEL_KEY)
+
+MAIN_PROMPT = """
+You are an expert Lifestyle Content Strategist, Visual Storyteller, and Lifestyle Visual Director specializing in authentic, aspirational, and emotionally transformative content. Your mission is to create a single, high-quality, realistic lifestyle image that visually communicates emotional transformation, aspirational living, and lifestyle storytelling based on the provided input image, its description, and category.
+
+Use your full capability to analyze and understand the input image before creation.
+Automatically select the most fitting lifestyle theme, emotional tone, environment, and visual mood **based on what is visible in the image** (product type, person, color, materials, category cues).
+Every choice — from lighting to setting — must logically and emotionally complement the reference subject.The scene created should be according to the product.
+Note to be followed strictly-(
+1-The image should show how that product is being used in real life.
+2-The scene should be right according to physics rules
+3-The image should be 100 percent right as in real world(earphone bud should be properly fixed in ears,no extra wire)
+4-Product should not change(any minute deatils should not change like logo,design,color,size(watch dial size should not be enlarged)))
+STRICT VISUAL INTEGRITY RULES:
+- The reference subject (product or person) must remain 100% unchanged: no alteration in color, logo, texture, proportions, design, or minute detail.
+- The product must be fully visible and unobstructed — not cropped, cut, or partially hidden.
+- If a person is present, show the full person naturally integrated and uncropped.
+- The scene and environment must adapt to the subject; the product itself must never adapt or be modified.
+
+INTERNAL CREATIVE REASONING (do not output):
+1. Identify the emotional aspiration or transformation the image should express.
+2. Determine the target audience and emotional drivers from context.
+3. Ensure authenticity, relatability, and alignment with real-life lifestyle moments.
+4. Select key lifestyle dimensions — wellness, adventure, creativity, luxury, sustainability, or mindfulness — based on the image.
+5. Express emotional transformation subtly through light, space, posture, or environmental harmony.
+
+LIFESTYLE CREATION FRAMEWORK
+
+Lifestyle Theme:
+- Choose dynamically (based on image) among: wellness, adventure, creativity, luxury, sustainability, or mindfulness.
+
+Aspirational Elements:
+- Reflect emotional aspirations such as balance, confidence, serenity, freedom, purpose, or authenticity — whichever aligns naturally with the subject.
+
+Emotional Triggers:
+- Evoke suitable emotions based on the image: peace, joy, curiosity, empowerment, or connection.
+
+Visual Aesthetics:
+- Use natural lighting (daylight, golden hour, or soft indoor glow).
+- Apply organic textures (linen, wood, stone, foliage, skin, water).
+- Maintain cinematic realism with natural tones — no artificial saturation or CGI stylization.
+- Ensure a believable, lived-in environment consistent with the product or lifestyle.
+
+Audience Strategy:
+- Target Persona: lifestyle-driven individual seeking emotional or lifestyle growth.
+- Lifestyle Goals: wellbeing, creativity, balance, adventure, or connection.
+- Pain Points: stress, monotony, burnout, lack of purpose.
+- Aspirational Identity: calm, fulfilled, grounded, and inspired.
+
+CONTENT STRUCTURE (internal narrative guidance only):
+- Primary Message: emotional core (e.g., “Find Your Calm,” “Live Boldly”).
+- Supporting Narrative: depict transformation through emotion, posture, or light.
+- Lifestyle Benefits: visualize peace, creativity, vitality, or belonging.
+- Implicit Call to Action: inspire lifestyle change (“Start Your Journey,” “Live Fully”).
+
+VISUAL DIRECTION AND CREATIVE INTENT
+
+Mood Board: warm, human-centered, emotionally real.
+Emotional Tone: choose based on image — peaceful, empowered, inspired, adventurous, or contemplative.
+Color Psychology:
+- Wellness → neutrals, soft greens, light beige.
+- Adventure → sunlit golds, earth blues.
+- Luxury → monochrome, muted metallics.
+- Sustainability → organic beiges, greens.
+- Creativity → expressive warm tones.
+- Mindfulness → soft whites, warm neutrals, golden light.
+
+Imagery Style:
+- Realistic, cinematic, and emotionally intimate.
+- Balanced composition (rule of thirds, depth, natural breathing space).
+- Genuine human emotion or atmosphere — not staged or artificial.
+- Real-world settings: cozy interiors, serene outdoors, creative studios, natural moments.
+
+EMOTIONAL STORYTELLING PRINCIPLES
+
+1. AUTHENTICITY OVER PERFECTION — natural emotion, real light.
+2. EMOTIONAL STORYTELLING — show transformation, not performance.
+3. ASPIRATIONAL RELATABILITY — inspire realistically, not ideally.
+4. INTEGRATED CONTEXT — spontaneous, not staged.
+5. HUMAN ENERGY — subtle, truthful emotion and connection.
+
+SCENE GUIDELINES
+
+Lighting: use the most natural option suitable for the chosen lifestyle mood.
+Texture: tactile and sensory.
+Depth: choose shallow focus for intimacy or wide depth for expansiveness — whichever fits the product.
+Composition: asymmetrical balance, natural framing.
+Avoid: flat tones, harsh filters, heavy stylization, or digital over-editing.
+
+CATEGORY-BASED VISUAL REFERENCES (auto-select based on image):
+- Wellness → serene space, calm morning, mindfulness.
+- Adventure → outdoor movement, golden light, vastness.
+- Luxury → minimal elegance, soft light, refinement.
+- Creativity → studio warmth, expressive realism.
+- Sustainability → nature harmony, eco materials, balance.
+- Mindfulness → soft focus, inner calm, simplicity.
+
+FINAL IMAGE REQUIREMENTS
+
+- Generate one high-quality, realistic, photographic lifestyle image.
+- Integrate the reference subject seamlessly into a natural, believable setting.
+- Maintain complete subject visibility and accuracy.
+- Evoke emotional transformation — from tension to peace, or longing to empowerment.
+- Use natural light and organic tone to tell a visual story.
+- No text, branding, or graphic overlays.
+- Image must feel editorial and emotionally grounded — like a premium lifestyle magazine moment.
+- Express transformation, belonging, and purpose through authenticity, light, and human emotion.
+
+The final image should look real, emotionally resonant, and aspirational — inspiring the viewer to feel:
+“This could be me, living fully, naturally, beautifully.”
+
+"""
+"""
+MAIN_PROMPT_2 =
+You are an expert Lifestyle Visual Director and Emotional Storyteller using Seedream 4.0’s editing capabilities (addition, deletion, replacement, modification) to create a high-quality, realistic, emotionally transformative lifestyle image. The goal is to integrate the given reference subject (product or person) seamlessly into a believable lifestyle scene that visually expresses aspiration, transformation, and authenticity.
+
+Strict Rules: The product or subject must not be changed, stylized, recolored, resized, cropped, or altered in any form. Keep all logos, labels, and minute details intact. The full product must be visible — no half or cut-off objects. If a person appears, the full person must be visible. The environment must adapt to the product, not the other way around.
+
+Seedream Edit Instructions: Use clear, concise commands — [Addition] to add realistic lifestyle elements, [Deletion] to remove distractions, [Replacement] to swap unnatural elements for emotionally aligned ones, [Modification] to adjust light, tone, or setting without altering the product. When needed, use visual markers (arrows, boxes, doodles) to specify edit locations.
+
+Creative Intent: Transform the image into an emotionally grounded lifestyle moment that tells a story of transformation and belonging. Capture authenticity, warmth, and realism using natural lighting, soft tones, and organic textures. Avoid flat, artificial, or overly saturated visuals.
+
+Lifestyle Framework:
+- Lifestyle Theme: (e.g., Wellness, Adventure, Luxury, Creativity, Sustainability)
+- Primary Message: short inspirational phrase (e.g., “Find Your Calm”, “Adventure Awaits”)
+- Supporting Narrative: micro-story showing emotional transformation through scene or light
+- Emotional Tone: calm, inspired, free, empowered, or connected
+- Aesthetic: cinematic realism, warm tones, natural light, human-centered composition
+- Color Psychology: neutrals & greens for wellness, warm golds & blues for adventure, soft beiges & naturals for sustainability, metallics for luxury
+- Setting Examples: serene home mornings, cozy studio, scenic outdoors, reflective moment
+
+Emotional Storytelling Principles:
+1. Authenticity over perfection — real emotion, not staged scenes.
+2. Emotional storytelling — show transformation subtly through light, posture, and setting.
+3. Aspirational relatability — evoke “this could be me, but better.”
+4. Integrated context — lifestyle feels spontaneous, not commercial.
+5. Human energy — natural gestures, warmth, and expression.
+
+Editing Goals:
+- [Addition] Add contextually relevant lifestyle elements (props, environment, light).
+- [Deletion] Remove unnatural, distracting, or non-aligned objects.
+- [Replacement] Replace unrealistic elements with authentic, thematic ones.
+- [Modification] Adjust lighting, mood, or tone for cinematic emotional realism.
+
+Final Output: One realistic, high-quality lifestyle image that looks editorial and emotionally resonant — authentic, aspirational, and human. Maintain full visual integrity of the product/person. No text, branding, or graphic overlays. Capture emotional transformation through authenticity, light, and storytelling.
+
+Example Format for Use:
+[Addition] Add a soft golden morning light and a ceramic mug beside the product to evoke calm.
+[Deletion] Remove harsh shadows in the background.
+[Replacement] Replace plain wall with a softly lit wooden home interior.
+[Modification] Warm tone slightly to enhance cozy lifestyle atmosphere.
+[Image]
+"""
+
+PROMPT_TEMPLATE = PromptTemplate.from_template(
+    "{main_prompt}\\n\\nCategory: {category}\\nDescription: {description}"
+).partial(main_prompt=MAIN_PROMPT)
+
+PROMPT_TEMPLATE_SEEDREAM = PromptTemplate.from_template(
+    "{main_prompt}\n\nCategory: {category}\nDescription: {description}"
+).partial(main_prompt=MAIN_PROMPT)
+
+MODELS = [
+    "gpt-image-1",
+    "gpt-image-1-mini",
+    "gemini-2.5-flash-image",
+    "seedream-4",
+    "seededit-3-0-i2i-250628",
+]
+
+MAX_REFERENCE_IMAGES = 3
+categories_list = [
+    "Accessories & Supplies",
+    "Additive Manufacturing Products",
+    "Abrasive & Finishing Products",
+    "Arts & Crafts Supplies",
+    "Arts, Crafts & Sewing Storage",
+    "Automotive Enthusiast Merchandise",
+    "Automotive Exterior Accessories",
+    "Automotive Interior Accessories",
+    "Automotive Paint & Paint Supplies",
+    "Automotive Performance Parts & Accessories",
+    "Automotive Replacement Parts",
+    "Automotive Tires & Wheels",
+    "Automotive Tools & Equipment",
+    "Baby",
+    "Baby Activity & Entertainment Products",
+    "Baby & Child Care Products",
+    "Baby & Toddler Feeding Supplies",
+    "Baby & Toddler Toys",
+    "Baby Care Products",
+    "Baby Diapering Products",
+    "Baby Gifts",
+    "Baby Girls' Clothing & Shoes",
+    "Baby Boys' Clothing & Shoes",
+    "Baby Safety Products",
+    "Baby Stationery",
+    "Baby Strollers & Accessories",
+    "Baby Travel Gear",
+    "Backpacks",
+    "Bath Products",
+    "Beading & Jewelry Making",
+    "Bedding",
+    "Beauty & Personal Care",
+    "Beauty Tools & Accessories",
+    "Boys' Accessories",
+    "Boys' Clothing",
+    "Boys' Jewelry",
+    "Boys' School Uniforms",
+    "Boys' Shoes",
+    "Boys' Watches",
+    "Building Supplies",
+    "Building Toys",
+    "Camera & Photo",
+    "Car Care",
+    "Car Electronics & Accessories",
+    "Cat Supplies",
+    "Cell Phones & Accessories",
+    "Child Safety Car Seats & Accessories",
+    "Commercial Door Products",
+    "Computer Components",
+    "Computer External Components",
+    "Computer Monitors",
+    "Computer Networking",
+    "Computer Servers",
+    "Computers",
+    "Computers & Tablets",
+    "Craft & Hobby Fabric",
+    "Craft Supplies & Materials",
+    "Cutting Tools",
+    "Data Storage",
+    "Diet & Sports Nutrition",
+    "Dolls & Accessories",
+    "Dog Supplies",
+    "eBook Readers & Accessories",
+    "Electrical Equipment",
+    "Electronic Components",
+    "Fabric Decorating",
+    "Fasteners",
+    "Filtration",
+    "Fish & Aquatic Pets",
+    "Finger Toys",
+    "Food Service Equipment & Supplies",
+    "Foot, Hand & Nail Care Products",
+    "Furniture",
+    "Games & Accessories",
+    "Garment Bags",
+    "Gift Cards",
+    "Gift Wrapping Supplies",
+    "Girls' Accessories",
+    "Girls' Clothing",
+    "Girls' Jewelry",
+    "Girls' School Uniforms",
+    "Girls' Shoes",
+    "Girls' Watches",
+    "GPS & Navigation",
+    "Hair Care Products",
+    "Hardware",
+    "Health & Household",
+    "Health Care Products",
+    "Headphones & Earbuds",
+    "Heavy Duty & Commercial Vehicle Equipment",
+    "Heating, Cooling & Air Quality",
+    "Home Appliances",
+    "Home Audio & Theater Products",
+    "Home Dcor Products",
+    "Home Lighting & Ceiling Fans",
+    "Home Storage & Organization",
+    "Horse Supplies",
+    "Household Cleaning Supplies",
+    "Household Supplies",
+    "Hydraulics, Pneumatics & Plumbing",
+    "Industrial Adhesives, Sealants & Lubricants",
+    "Industrial Hardware",
+    "Industrial Materials",
+    "Industrial Power & Hand Tools",
+    "Industrial & Scientific",
+    "Ironing Products",
+    "Janitorial & Sanitation Supplies",
+    "Kids' Dress Up & Pretend Play",
+    "Kids' Electronics",
+    "Kids' Furniture",
+    "Kids' Home Store",
+    "Kids' Party Supplies",
+    "Kids' Play Boats",
+    "Kids' Play Buses",
+    "Kids' Play Cars & Race Cars",
+    "Kids' Play Tractors",
+    "Kids' Play Trains & Trams",
+    "Kids' Play Trucks",
+    "Kitchen & Bath Fixtures",
+    "Kitchen & Dining",
+    "Knitting & Crochet Supplies",
+    "Lab & Scientific Products",
+    "Laptop Accessories",
+    "Laptop Bags",
+    "Learning & Education Toys",
+    "Legacy Systems",
+    "Light Bulbs",
+    "Lights, Bulbs & Indicators",
+    "Luggage",
+    "Luggage Sets",
+    "Makeup",
+    "Material Handling Products",
+    "Measuring & Layout",
+    "Men's Accessories",
+    "Men's Clothing",
+    "Men's Shoes",
+    "Men's Watches",
+    "Messenger Bags",
+    "Motorcycle & Powersports",
+    "Needlework Supplies",
+    "Nintendo 3DS & 2DS Consoles, Games & Accessories",
+    "Nintendo DS Games, Consoles & Accessories",
+    "Nintendo Switch Consoles, Games & Accessories",
+    "Novelty Toys & Amusements",
+    "Nursery Furniture, Bedding & Dcor",
+    "Occupational Health & Safety Products",
+    "Office Electronics",
+    "Oil & Fluids",
+    "Online Video Game Services",
+    "Oral Care Products",
+    "Outdoor Recreation",
+    "Packaging & Shipping Supplies",
+    "Paint, Wall Treatments & Supplies",
+    "Painting, Drawing & Art Supplies",
+    "Party Decorations",
+    "Party Supplies",
+    "Perfumes & Fragrances",
+    "Personal Care Products",
+    "Pet Bird Supplies",
+    "PlayStation 3 Games, Consoles & Accessories",
+    "PlayStation 4 Games, Consoles & Accessories",
+    "PlayStation 5 Consoles, Games & Accessories",
+    "PlayStation Vita Games, Consoles & Accessories",
+    "Portable Audio & Video",
+    "Power Tools & Hand Tools",
+    "Power Transmission Products",
+    "Pregnancy & Maternity Products",
+    "Printmaking Supplies",
+    "Professional Dental Supplies",
+    "Professional Medical Supplies",
+    "Pumps & Plumbing Equipment",
+    "Puppets & Puppet Theaters",
+    "Puzzles",
+    "Rain Umbrellas",
+    "Reptiles & Amphibian Supplies",
+    "Retail Store Fixtures & Equipment",
+    "RV Parts & Accessories",
+    "Safety & Security",
+    "Science Education Supplies",
+    "Scrapbooking & Stamping Supplies",
+    "Security & Surveillance Equipment",
+    "Seasonal Dcor",
+    "Sewing Products",
+    "Sexual Wellness Products",
+    "Shaving & Hair Removal Products",
+    "Skin Care Products",
+    "Slot Cars, Race Tracks & Accessories",
+    "Small Animal Supplies",
+    "Smart Home - Heating & Cooling",
+    "Smart Home Thermostats - Compatibility Checker",
+    "Smart Home: Home Entertainment",
+    "Smart Home: Lawn and Garden",
+    "Smart Home: Lighting",
+    "Smart Home: New Smart Devices",
+    "Smart Home: Other Solutions",
+    "Smart Home: Plugs and Outlets",
+    "Smart Home: Security Cameras and Systems",
+    "Smart Home: Smart Locks and Entry",
+    "Smart Home: Vacuums and Mops",
+    "Smart Home: Voice Assistants and Hubs",
+    "Smart Home: WiFi and Networking",
+    "Software & PC Games",
+    "Sony PSP Games, Consoles & Accessories",
+    "Sports & Fitness",
+    "Sports & Outdoor Play Toys",
+    "Sports & Outdoors",
+    "Sports Nutrition Products",
+    "Stationery & Gift Wrapping Supplies",
+    "Stuffed Animals & Plush Toys",
+    "Suitcases",
+    "Tablet Accessories",
+    "Tablet Replacement Parts",
+    "Televisions & Video Products",
+    "Test, Measure & Inspect",
+    "Tools & Home Improvement",
+    "Toilet Training Products",
+    "Toy Figures & Playsets",
+    "Toy Vehicle Playsets",
+    "Tricycles, Scooters & Wagons",
+    "Travel Accessories",
+    "Travel Duffel Bags",
+    "Travel Tote Bags",
+    "Vehicle Electronics",
+    "Video Game Consoles & Accessories",
+    "Video Games",
+    "Video Projectors",
+    "Vision Products",
+    "Virtual Reality Hardware & Accessories",
+    "Wall Art",
+    "Wearable Technology",
+    "Wellness & Relaxation Products",
+    "Welding & Soldering",
+    "Wii Games, Consoles & Accessories",
+    "Wii U Games, Consoles & Accessories",
+    "Women's Accessories",
+    "Women's Clothing",
+    "Women's Handbags",
+    "Women's Jewelry",
+    "Women's Shoes",
+    "Women's Watches",
+    "Xbox 360 Games, Consoles & Accessories",
+    "Xbox One Games, Consoles & Accessories",
+    "Xbox Series X & S Consoles, Games & Accessories",
+    "Other",
+]
+
+
+def ensure_excel() -> None:
+    tmp = download_excel_from_s3()
+    tmp.unlink(missing_ok=True)
+
+
+def log_entry(entry: List[Any]) -> None:
+    ensure_excel()
+    tmp = download_excel_from_s3()
+    entry = list(entry)
+    while len(entry) < len(EXCEL_HEADERS):
+        entry.append(None)
+    wb = load_workbook(tmp)
+    ws = wb.active
+    ws.append(entry[:len(EXCEL_HEADERS)])
+    wb.save(tmp)
+    upload_excel_to_s3(tmp)
+    tmp.unlink(missing_ok=True)
+
+
+def upload_image_to_s3(image_path: Path, key_prefix: str) -> Tuple[Optional[str], Optional[str]]:
+    link = upload_file_to_s3(image_path, key_prefix, content_type="image/jpeg", public=True)
+    return link, link
+
+
+def decode_possible_base64(value: Any) -> Optional[bytes]:
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        for strict in (True, False):
+            try:
+                return base64.b64decode(value, validate=strict)
+            except Exception:
+                continue
+    return None
+
+
+def image_from_base64(data: Any) -> Optional[Image.Image]:
+    raw = decode_possible_base64(data)
+    if not raw:
+        return None
+    try:
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+    except Exception as exc:
+        print("[error] Unable to decode base64 image:", exc)
+        return None
+
+
+def pil_to_base64(image: Image.Image) -> str:
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def pil_to_data_uri(image: Image.Image, fmt: str = "png") -> str:
+    buf = io.BytesIO()
+    image.convert("RGB").save(buf, format=fmt.upper())
+    encoded = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/{fmt.lower()};base64,{encoded}"
+
+
+def _image_from_ark_response(resp_obj: Any) -> Optional[Image.Image]:
+    if resp_obj is None:
+        return None
+    url = getattr(resp_obj, "url", None)
+    if url:
+        img = download_image_from_url(url)
+        if img:
+            return img
+    b64_data = getattr(resp_obj, "b64_json", None)
+    if b64_data:
+        return image_from_base64(b64_data)
+    return None
+
+
+async def seedream_generate(
+    prompt: str,
+    image: Optional[Image.Image],
+    image_urls: Optional[List[str]] = None,
+    prefer_inline: bool = False,
+) -> Optional[Image.Image]:
+    if not ARK_API_KEY:
+        print("[info] Seedream unavailable in this environment.")
+        return None
+
+    reference_urls = [url for url in (image_urls or []) if url and url.startswith(("http://", "https://"))]
+    inline_reference = None
+    if image is not None and (prefer_inline or not reference_urls):
+        inline_reference = pil_to_data_uri(image)
+
+    def _prepare_image_arg():
+        if inline_reference:
+            return inline_reference
+        if not reference_urls:
+            return None
+        return reference_urls if len(reference_urls) > 1 else reference_urls[0]
+
+    if ARK_SDK_CLIENT:
+        def _sdk_call():
+            request_kwargs = {
+                "model": "seedream-4-0-250828",
+                "prompt": prompt,
+                "size": "2K",
+                "response_format": "url",
+                "watermark": False,
+                "sequential_image_generation": "auto",
+            }
+            image_arg = _prepare_image_arg()
+            if image_arg is not None:
+                request_kwargs["image"] = image_arg
+            if SequentialImageGenerationOptions:
+                request_kwargs["sequential_image_generation_options"] = SequentialImageGenerationOptions(max_images=1)
+            resp = ARK_SDK_CLIENT.images.generate(**request_kwargs)
+            return _image_from_ark_response(resp.data[0] if resp.data else None)
+
+        return await run_blocking(_sdk_call)
+
+    def _http_call():
+        payload = {
+            "model": "seedream-4-0-250828",
+            "prompt": prompt,
+            "size": "2K",
+            "response_format": "url",
+            "watermark": True,
+            "sequential_image_generation": "auto",
+        }
+        image_arg = _prepare_image_arg()
+        if image_arg is not None:
+            payload["image"] = image_arg
+        headers = {
+            "Authorization": f"Bearer {ARK_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = requests.post(SEEDREAM_ENDPOINT, json=payload, headers=headers, timeout=120)
+        except Exception as exc:
+            print("[error] Seedream API request failed:", exc)
+            return None
+        if resp.status_code != 200:
+            print(f"[error] Seedream HTTP {resp.status_code}: {resp.text}")
+            return None
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            print("[error] Seedream response was not JSON:", exc, resp.text)
+            return None
+        images = data.get("data")
+        if not images:
+            print("[error] Seedream response missing image data:", data)
+            return None
+        first = images[0]
+        url = first.get("url")
+        if url:
+            return download_image_from_url(url)
+        b64_data = first.get("b64_json")
+        if b64_data:
+            return image_from_base64(b64_data)
+        print("[error] Seedream response missing usable image data:", first)
+        return None
+
+    return await run_blocking(_http_call)
+
+
+
+async def seededit_generate(
+    prompt: str,
+    image: Optional[Image.Image],
+    reference_url: Optional[str],
+    prefer_inline: bool = False,
+) -> Optional[Image.Image]:
+    if not ARK_API_KEY:
+        print("[info] SeedEdit unavailable in this environment.")
+        return None
+    if not ARK_SDK_CLIENT:
+        print("[info] SeedEdit requires the Ark SDK client.")
+        return None
+    if reference_url is None and image is None:
+        print("[warn] SeedEdit requires at least one reference image.")
+        return None
+
+    inline_reference = None
+    if image is not None and (prefer_inline or not reference_url):
+        inline_reference = pil_to_data_uri(image)
+
+    def _call():
+        request_kwargs = {
+            "model": "seededit-3-0-i2i-250628",
+            "prompt": prompt,
+            "response_format": "url",
+            "size": "adaptive",
+            "seed": 123,
+            "guidance_scale": 5.5,
+            "watermark": True,
+        }
+        if inline_reference:
+            request_kwargs["image"] = inline_reference
+        elif reference_url:
+            request_kwargs["image"] = reference_url
+        elif image is not None:
+            request_kwargs["image"] = pil_to_data_uri(image)
+        resp = ARK_SDK_CLIENT.images.generate(**request_kwargs)
+        return _image_from_ark_response(resp.data[0] if resp.data else None)
+
+    return await run_blocking(_call)
+
+
+def build_reference_url(image: Optional[Image.Image], link: Optional[str]) -> Optional[str]:
+    if link:
+        return link
+    if image is not None:
+        return pil_to_data_uri(image)
+    return None
+
+
+def format_storage_links(view_link: Optional[str], download_link: Optional[str]) -> Optional[str]:
+    parts: List[str] = []
+    if view_link:
+        parts.append(f"View: {view_link}")
+    if download_link:
+        parts.append(f"Download: {download_link}")
+    if not parts:
+        return None
+    return "\n".join(parts)
+
+
+def add_reference_to_prompt(prompt: str, reference_url: Optional[str]) -> str:
+    if not reference_url:
+        return prompt
+    return (
+        f"{prompt}\n\nReference Image URL: {reference_url}\n"
+        "Preserve the original product exactly while embedding it naturally in the new scene."
+    )
+
+
+def to_pil_image(image: Any) -> Optional[Image.Image]:
+    if image is None:
+        return None
+    if isinstance(image, Image.Image):
+        return image
+    if isinstance(image, np.ndarray):
+        if image.dtype != "uint8":
+            image = image.astype("uint8")
+        return Image.fromarray(image)
+    return None
+
+
+def combine_reference_images(images: List[Image.Image]) -> Image.Image:
+    """
+    Merge multiple reference shots side-by-side so models receive a single contextual image.
+    """
+    if not images:
+        raise ValueError("No images provided for combination.")
+    if len(images) == 1:
+        return images[0]
+
+    max_height = max(img.height for img in images)
+    normalized: List[Image.Image] = []
+    for img in images:
+        if img.height != max_height:
+            scale = max_height / img.height
+            new_width = max(1, int(img.width * scale))
+            img = img.resize((new_width, max_height), Image.LANCZOS)
+        normalized.append(img)
+
+    total_width = sum(img.width for img in normalized)
+    combined = Image.new("RGB", (total_width, max_height), color=(255, 255, 255))
+    offset = 0
+    for img in normalized:
+        combined.paste(img, (offset, 0))
+        offset += img.width
+    return combined
+
+
+def ensure_aspect_ratio_bounds(
+    image: Optional[Image.Image],
+    min_ratio: float = 0.34,
+    max_ratio: float = 2.9,
+) -> Tuple[Optional[Image.Image], bool]:
+    if image is None:
+        return None, False
+    width, height = image.size
+    if not width or not height:
+        return image, False
+    ratio = width / height
+    if min_ratio <= ratio <= max_ratio:
+        return image, False
+    target_width = width
+    target_height = height
+    if ratio < min_ratio:
+        target_width = max(width, math.ceil(height * min_ratio))
+    else:
+        target_height = max(height, math.ceil(width / max_ratio))
+    canvas = Image.new("RGB", (target_width, target_height), color=(255, 255, 255))
+    offset_x = (target_width - width) // 2
+    offset_y = (target_height - height) // 2
+    canvas.paste(image.convert("RGB"), (offset_x, offset_y))
+    return canvas, True
+
+def save_input_image(image: Optional[Image.Image], ts: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    if image is None:
+        return None, None, None
+    temp_path = Path(tempfile.gettempdir()) / f"{ts}_input.jpg"
+    image.convert("RGB").save(temp_path, format="JPEG", quality=95)
+    download_link, view_link = upload_image_to_s3(temp_path, S3_INPUT_PREFIX)
+    temp_path.unlink(missing_ok=True)
+    return None, download_link, view_link
+
+
+def download_image_from_url(url: str) -> Optional[Image.Image]:
+    if not url:
+        return None
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        return Image.open(io.BytesIO(response.content)).convert("RGB")
+    except Exception as exc:
+        print("[warn] Failed to download image:", exc)
+        return None
+
+
+
+
+async def generate_with_openai_image_model(
+    model_name: str,
+    prompt: str,
+    image: Optional[Image.Image],
+    input_link: Optional[str],
+) -> Optional[Image.Image]:
+    reference_url = build_reference_url(image, input_link)
+    prompt_with_reference = add_reference_to_prompt(prompt, reference_url)
+    prompt_with_reference = clamp_prompt_length(prompt_with_reference)
+
+    def _call():
+        response = OPENAI_CLIENT.images.generate(
+            model=model_name,
+            prompt=prompt_with_reference,
+            size="1024x1024",
+        )
+        data = response.data[0].b64_json
+        return image_from_base64(data)
+
+    return await run_blocking(_call)
+
+
+async def generate_with_gemini_image_model(
+    model_name: str,
+    prompt: str,
+    image: Optional[Image.Image],
+    input_link: Optional[str],
+) -> Optional[Image.Image]:
+    reference_url = build_reference_url(image, input_link)
+    prompt = clamp_prompt_length(prompt)
+
+    def _call():
+        contents: List[Any] = [prompt]
+        if image is not None:
+            contents.append(image)
+        elif reference_url:
+            downloaded = download_image_from_url(reference_url)
+            if downloaded:
+                contents.append(downloaded)
+        resp = gclient.models.generate_content(
+            model=model_name,
+            contents=contents,
+        )
+        candidates = getattr(resp, "candidates", None) or []
+        for candidate in candidates:
+            candidate_content = getattr(candidate, "content", None)
+            if not candidate_content:
+                continue
+            for part in getattr(candidate_content, "parts", None) or []:
+                inline_data = getattr(part, "inline_data", None)
+                if inline_data and getattr(inline_data, "data", None):
+                    return image_from_base64(inline_data.data)
+        resp_parts = getattr(resp, "parts", None)
+        if resp_parts:
+            for part in resp_parts:
+                inline_data = getattr(part, "inline_data", None)
+                if inline_data and getattr(inline_data, "data", None):
+                    return image_from_base64(inline_data.data)
+        return None
+
+    return await run_blocking(_call)
+
+
+async def generate_with_seedream_model(
+    model_name: str,
+    prompt: str,
+    image: Optional[Image.Image],
+    input_link: Optional[str],
+) -> Optional[Image.Image]:
+    prepared_image, was_adjusted = ensure_aspect_ratio_bounds(image)
+    image_urls = [input_link] if input_link else None
+    prefer_inline = was_adjusted or not image_urls
+    return await seedream_generate(
+        prompt,
+        prepared_image,
+        image_urls=image_urls,
+        prefer_inline=prefer_inline,
+    )
+
+
+async def generate_with_seededit_model(
+    model_name: str,
+    prompt: str,
+    image: Optional[Image.Image],
+    input_link: Optional[str],
+) -> Optional[Image.Image]:
+    prepared_image, was_adjusted = ensure_aspect_ratio_bounds(image)
+    reference_url = build_reference_url(prepared_image, input_link)
+    prefer_inline = was_adjusted or not reference_url
+    return await seededit_generate(
+        prompt,
+        prepared_image,
+        reference_url,
+        prefer_inline=prefer_inline,
+    )
+
+
+MODEL_GENERATORS: Dict[str, Any] = {
+    "gpt-image-1": generate_with_openai_image_model,
+    "gpt-image-1-mini": generate_with_openai_image_model,
+    "gemini-2.5-flash-image": generate_with_gemini_image_model,
+    "seedream-4": generate_with_seedream_model,
+    "seededit-3-0-i2i-250628": generate_with_seededit_model,
+}
+
+
+async def generate_for_model(
+    model_name: str,
+    category: str,
+    description: str,
+    image: Optional[Image.Image],
+    ts: str,
+    input_download_link: Optional[str],
+    input_link_display: Optional[str],
+    output_index: int = 1,
+) -> Optional[Image.Image]:
+    template = PROMPT_TEMPLATE_SEEDREAM if model_name == "seedream-4" else PROMPT_TEMPLATE
+    prompt = template.format(category=category, description=description)
+    prompt = clamp_prompt_length(prompt)
+    generator = MODEL_GENERATORS.get(model_name)
+    if not generator:
+        raise ValueError(f"Unsupported model: {model_name}")
+    inference_start = time.perf_counter()
+    out_img = await generator(model_name, prompt, image, input_download_link)
+    if not out_img:
+        print(f"[warn] {model_name} returned no image.")
+        return None
+
+    temp_path = Path(tempfile.gettempdir()) / f"{ts}_{model_name}_gen{output_index}.jpg"
+    out_img.save(temp_path)
+    out_download_link, out_view_link = upload_image_to_s3(temp_path, S3_OUTPUT_PREFIX)
+    temp_path.unlink(missing_ok=True)
+    output_link_display = format_storage_links(out_view_link, out_download_link)
+    latency = round(time.perf_counter() - inference_start, 3)
+    speed = round(1 / latency, 3) if latency else None
+    tokens = len(prompt.split())
+    resolution = f"{out_img.width}x{out_img.height}"
+
+    log_entry([
+        ts,
+        category,
+        description,
+        model_name,
+        output_index,
+        None,
+        None,
+        None,
+        input_link_display,
+        output_link_display,
+        speed,
+        latency,
+        tokens,
+        1,
+        resolution,
+    ])
+
+    return out_img
+
+
+async def generate_all(
+    category: str,
+    description: str,
+    image: Optional[Image.Image],
+    output_index: int = 1,
+) -> List[Optional[Image.Image]]:
+    ts = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d_%H-%M-%S")
+    pil_image = to_pil_image(image)
+    if pil_image is None:
+        return [None] * len(MODELS)
+    _, input_download_link, input_view_link = save_input_image(pil_image, ts)
+    input_link_display = format_storage_links(input_view_link, input_download_link)
+    tasks = [
+        generate_for_model(
+            model,
+            category,
+            description,
+            pil_image,
+            ts,
+            input_download_link,
+            input_link_display,
+            output_index,
+        )
+        for model in MODELS
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    formatted: List[Optional[Image.Image]] = []
+    for result in results:
+        if isinstance(result, Exception):
+            print("[error] Generation failed:", result)
+            formatted.append(None)
+        else:
+            formatted.append(result)
+    return formatted
+
+
+def generate_sync(
+    category: str,
+    description: str,
+    image: Any,
+    output_index: int = 1,
+) -> List[Optional[Image.Image]]:
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(generate_all(category, description, image, output_index))
+    finally:
+        loop.close()
+
+
+def handle_feedback(model_id: str, image_index: int, feedback: str, text: str, score: Optional[float]) -> str:
+    ensure_excel()
+    tmp = download_excel_from_s3()
+    df = pd.read_excel(tmp)
+    expected_cols = [
+        "Timestamp",
+        "Category",
+        "Description",
+        "Model Name",
+        "Output Image No",
+        "Thumbs (1=Like,0=Dislike)",
+        "Review",
+        "Score by Human",
+        "Input Image (Link)",
+        "Output Image (Link)",
+        "Inference Speed (img/sec)",
+        "Latency (sec)",
+        "Token Processed (in+out)",
+        "Images Generated",
+        "Image Quality (resolution)",
+    ]
+    df = df.reindex(columns=expected_cols)
+    match = df[(df["Model Name"] == model_id) & (df["Output Image No"] == image_index)]
+    if match.empty:
+        return " No matching entry found."
+    idx = match.index[-1]
+    df.loc[idx, "Thumbs (1=Like,0=Dislike)"] = 1 if feedback == "up" else 0
+    df.loc[idx, "Review"] = text
+    df.loc[idx, "Score by Human"] = score
+    df.to_excel(tmp, index=False)
+    upload_excel_to_s3(tmp)
+    tmp.unlink(missing_ok=True)
+    return f" Feedback saved for {model_id} (image {image_index})"
+
+
+def load_uploaded_image(uploaded_file: Optional[Any]) -> Optional[Image.Image]:
+    if uploaded_file is None:
+        return None
+    try:
+        return Image.open(uploaded_file).convert("RGB")
+    except Exception as exc:  # noqa: BLE001
+        print("[warn] Failed to read uploaded image:", exc)
+        return None
+
+
+def update_status_text(value: str) -> None:
+    st.session_state["status_text"] = value
+
+
+def main() -> None:
+    st.set_page_config(page_title="Lifestyle Product Image Generator", layout="wide")
+    st.markdown("#  Lifestyle Product Image Generator & Feedback (Drive Edition)")
+
+    if "generation" not in st.session_state:
+        st.session_state["generation"] = None
+    if "status_text" not in st.session_state:
+        st.session_state["status_text"] = "Ready!"
+
+    with st.form("generator_form"):
+        st.write("### Reference Images")
+        upload_cols = st.columns(MAX_REFERENCE_IMAGES)
+        uploads: List[Any] = []
+        url_inputs: List[str] = []
+        for idx, col in enumerate(upload_cols, start=1):
+            with col:
+                uploads.append(col.file_uploader(f"Upload Image {idx}", type=["png", "jpg", "jpeg"], key=f"upload_{idx}"))
+                url_inputs.append(col.text_input(f"Or Paste Image {idx} URL", key=f"url_{idx}"))
+
+        category = st.selectbox("Select Category", options=categories_list, index=0, key="category_select")
+        custom_cat_value = ""
+        if category == "Other":
+            custom_cat_value = st.text_input("Custom Category (if Other)", key="custom_category")
+        description = st.text_area("Description", key="description_text", height=80)
+        submitted = st.form_submit_button(" Generate Lifestyle Images")
+
+    if submitted:
+        collected: List[Image.Image] = []
+        for upload, url in zip(uploads, url_inputs):
+            img = load_uploaded_image(upload)
+            if img is None and url:
+                img = download_image_from_url(url.strip())
+            if img is not None:
+                collected.append(img)
+
+        final_category = (custom_cat_value.strip() if category == "Other" and custom_cat_value else category) or "Other"
+        if not collected:
+            update_status_text(" Please upload at least one image or provide a valid image URL.")
+            st.warning("Please upload at least one image or provide a valid image URL.")
+        else:
+            try:
+                reference_image = combine_reference_images(collected)
+            except Exception as exc:  # noqa: BLE001
+                update_status_text(" Unable to prepare the reference preview from the provided inputs.")
+                st.error(f"Unable to prepare the reference preview: {exc}")
+            else:
+                generated_images = generate_sync(final_category, description, reference_image, output_index=1)
+                produced_outputs = sum(1 for img in generated_images if img is not None)
+                status_msg = (
+                    f" Combined {len(collected)} reference image(s) & generated {produced_outputs} outputs."
+                    if produced_outputs
+                    else " Generation failed for the provided references."
+                )
+                update_status_text(status_msg)
+                st.session_state["generation"] = {
+                    "reference_image": reference_image,
+                    "outputs": generated_images,
+                    "category": final_category,
+                    "description": description,
+                }
+
+    st.text_input("Status", value=st.session_state["status_text"], disabled=True)
+
+    generation = st.session_state.get("generation")
+    if generation:
+        st.markdown("### Reference Preview")
+        st.image(generation["reference_image"], caption="Combined Reference", use_container_width=True)
+
+        st.markdown("### Model Outputs")
+        for model_name, img in zip(MODELS, generation["outputs"]):
+            st.markdown(f"#### {model_name}")
+            if img is None:
+                st.info("No image generated for this model.")
+                continue
+            st.image(img, use_container_width=True)
+            review_key = f"review_{model_name}"
+            score_key = f"score_{model_name}"
+            feedback_key = f"feedback_status_{model_name}"
+            st.text_area("Review", key=review_key, height=80)
+            st.number_input("Score (100)", min_value=0.0, max_value=100.0, step=1.0, key=score_key)
+            btn_cols = st.columns(2)
+
+            def submit_feedback(feedback_type: str) -> None:
+                review_val = st.session_state.get(review_key, "")
+                score_val = st.session_state.get(score_key)
+                message = handle_feedback(model_name, 1, feedback_type, review_val, score_val)
+                st.session_state[feedback_key] = message
+
+            if btn_cols[0].button("Thumbs Up", key=f"thumb_up_{model_name}"):
+                submit_feedback("up")
+            if btn_cols[1].button("Thumbs Down", key=f"thumb_down_{model_name}"):
+                submit_feedback("down")
+
+            if feedback_key in st.session_state:
+                st.success(st.session_state[feedback_key])
+
+
+if __name__ == "__main__":
+    main()
