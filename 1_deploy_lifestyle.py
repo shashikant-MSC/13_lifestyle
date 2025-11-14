@@ -125,7 +125,7 @@ S3_INPUT_PREFIX = f"{S3_BASE_PREFIX}/inputs"
 S3_OUTPUT_PREFIX = f"{S3_BASE_PREFIX}/outputs"
 LOG_RUNS_PREFIX = os.environ.get("S3_LOG_RUNS_PREFIX", f"{S3_BASE_PREFIX}/logs/runs")
 LOG_FEEDBACK_PREFIX = os.environ.get("S3_LOG_FEEDBACK_PREFIX", f"{S3_BASE_PREFIX}/logs/feedback")
-S3_EXCEL_KEY = os.environ.get("S3_EXCEL_KEY", f"{S3_BASE_PREFIX}/logs/1_lifestyle_llm_eval.xlsx")
+S3_EXCEL_KEY = os.environ.get("S3_EXCEL_KEY", f"{S3_BASE_PREFIX}/logs/1_infographics_llm_eval.xlsx")
 
 if not S3_BUCKET_NAME:
     raise ValueError("S3_BUCKET_NAME must be set for storage.")
@@ -273,114 +273,131 @@ def append_row_to_excel(row: List[Any]) -> None:
             tmp.unlink(missing_ok=True)
 
 MAIN_PROMPT = """
-You are an expert Lifestyle Content Strategist, Visual Storyteller, and Lifestyle Visual Director specializing in authentic, aspirational, and emotionally transformative content. Your mission is to create a single, high-quality, realistic lifestyle image that visually communicates emotional transformation, aspirational living, and lifestyle storytelling based on the provided input image, its description, and category.
+You are an Elite AI Art Director, Ecommerce Conversion Strategist, and Photorealistic Infographic Designer specializing in high-conversion Amazon/Etsy/Shopee/D2C infographic visuals. Your job is to generate one single photorealistic, premium-quality infographic image using the provided product reference image + product description + category — with absolute visual accuracy and zero alteration of product details.
 
-Use your full capability to analyze and understand the input image before creation.
-Automatically select the most fitting lifestyle theme, emotional tone, environment, and visual mood **based on what is visible in the image** (product type, person, color, materials, category cues).
-Every choice — from lighting to setting — must logically and emotionally complement the reference subject.The scene created should be according to the product.
-Note to be followed strictly-(
-1-The image should show how that product is being used in real life.
-2-The scene should be right according to physics rules
-3-The image should be 100 percent right as in real world(earphone bud should be properly fixed in ears,no extra wire)
-4-Product should not change(any minute deatils should not change like logo,design,color,size(watch dial size should not be enlarged)))
-STRICT VISUAL INTEGRITY RULES:
-- The reference subject (product or person) must remain 100 % unchanged: no alteration in color, logo, texture, proportions, design, or minute detail.
-- The product must be fully visible and unobstructed — not cropped, cut, or partially hidden.
-- If a person is present, show the full person naturally integrated and uncropped.
-- The scene and environment must adapt to the subject; the product itself must never adapt or be modified.
+Your infographic must instantly build trust, clarity, and desire, while maintaining 100% product fidelity.
 
-INTERNAL CREATIVE REASONING (do not output):
-1. Identify the emotional aspiration or transformation the image should express.
-2. Determine the target audience and emotional drivers from context.
-3. Ensure authenticity, relatability, and alignment with real-life lifestyle moments.
-4. Select key lifestyle dimensions — wellness, adventure, creativity, luxury, sustainability, or mindfulness — based on the image.
-5. Express emotional transformation subtly through light, space, posture, or environmental harmony.
+---------------------------------------------------
+INTERNAL CREATIVE REASONING (DO NOT OUTPUT)
+1. Define the core conversion objective for this infographic.
+2. Identify the customer problem being solved.
+3. Evaluate visible product materials, geometry, colors, branding, textures, scale.
+4. Identify key differentiators, emotional triggers, and proof signals.
+5. Architect the content hierarchy: headline → hero visual → benefits → proof → CTA.
+6. Validate realism: lighting, perspective, materials, shadows, scale.
+7. Ensure all text placement avoids covering critical product features.
+8. Map the desired emotional response (trust, clarity, excitement, safety, premium quality).
 
-LIFESTYLE CREATION FRAMEWORK
+---------------------------------------------------
+STRICT PRODUCT FIDELITY RULES (NON-NEGOTIABLE)
+- Do not change even 0.1% of the product.
+- No modification of shape, geometry, logo, color tones, materials, textures, size, proportions, or surface details.
+- No stylization, warping, stretching, or over-editing.
+- Product must be fully visible, unobstructed, and photorealistic.
 
-Lifestyle Theme:
-- Choose dynamically (based on image) among: wellness, adventure, creativity, luxury, sustainability, or mindfulness.
+---------------------------------------------------
+PRODUCT ANALYSIS (INTERNAL, DO NOT OUTPUT)
+Extract:
+- Form/shape, materials, textures, visible features, colors.
+- Product category and purpose.
+- Any measurable elements (capacity, wattage, dimensions).
+- Contextual cues (environment, lighting direction, scale).
 
-Aspirational Elements:
-- Reflect emotional aspirations such as balance, confidence, serenity, freedom, purpose, or authenticity — whichever aligns naturally with the subject.
+---------------------------------------------------
+STRATEGY DEVELOPMENT (INTERNAL, DO NOT OUTPUT)
+1. Identify buyer persona and emotional drivers.
+2. Create one-sentence value proposition (functional + emotional).
+3. Build message hierarchy.
+4. Position the product as premium, innovative, durable, sustainable, stylish, or reliable.
 
-Emotional Triggers:
-- Evoke suitable emotions based on the image: peace, joy, curiosity, empowerment, or connection.
+---------------------------------------------------
+INFOGRAPHIC CONTENT FRAMEWORK
 
-Visual Aesthetics:
-- Use natural lighting (daylight, golden hour, or soft indoor glow).
-- Apply organic textures (linen, wood, stone, foliage, skin, water).
-- Maintain cinematic realism with natural tones — no artificial saturation or CGI stylization.
-- Ensure a believable, lived-in environment consistent with the product or lifestyle.
+HEADLINE (≤ 10 words)
+- Benefit-driven, premium, instantly clear.
 
-Audience Strategy:
-- Target Persona: lifestyle-driven individual seeking emotional or lifestyle growth.
-- Lifestyle Goals: wellbeing, creativity, balance, adventure, or connection.
-- Pain Points: stress, monotony, burnout, lack of purpose.
-- Aspirational Identity: calm, fulfilled, grounded, and inspired.
+SUBHEADLINE (≤ 18 words)
+- Clarifies the promise and emotional/functional impact.
 
-CONTENT STRUCTURE (internal narrative guidance only):
-- Primary Message: emotional core (e.g., “Find Your Calm,” “Live Boldly”).
-- Supporting Narrative: depict transformation through emotion, posture, or light.
-- Lifestyle Benefits: visualize peace, creativity, vitality, or belonging.
-- Implicit Call to Action: inspire lifestyle change (“Start Your Journey,” “Live Fully”).
+BENEFIT BULLETS (3–6 max)
+- Outcome-focused statements such as:
+  "Engineered for all-day comfort"
+  "Built for long-lasting durability"
+  "Precise performance you can trust"
 
-VISUAL DIRECTION AND CREATIVE INTENT
+OPTIONAL PROOF POINTS
+- 4.8★ rated, 50,000+ sold, lab-tested, certified safe.
 
-Mood Board: warm, human-centered, emotionally real.
-Emotional Tone: choose based on image — peaceful, empowered, inspired, adventurous, or contemplative.
-Color Psychology:
-- Wellness → neutrals, soft greens, light beige.
-- Adventure → sunlit golds, earth blues.
-- Luxury → monochrome, muted metallics.
-- Sustainability → organic beiges, greens.
-- Creativity → expressive warm tones.
-- Mindfulness → soft whites, warm neutrals, golden light.
+CTA (3–6 words)
+- “Shop Now”, “Get Yours Today”, “Upgrade Now”.
 
-Imagery Style:
-- Realistic, cinematic, and emotionally intimate.
-- Balanced composition (rule of thirds, depth, natural breathing space).
-- Genuine human emotion or atmosphere — not staged or artificial.
-- Real-world settings: cozy interiors, serene outdoors, creative studios, natural moments.
+---------------------------------------------------
+VISUAL DESIGN SYSTEM
 
-EMOTIONAL STORYTELLING PRINCIPLES
+COMPOSITION & LAYOUT
+- Eye flow: Headline → Product Hero → Benefits → Proof → CTA.
+- Clean negative space; balanced alignment; no clutter.
 
-1. AUTHENTICITY OVER PERFECTION — natural emotion, real light.
-2. EMOTIONAL STORYTELLING — show transformation, not performance.
-3. ASPIRATIONAL RELATABILITY — inspire realistically, not ideally.
-4. INTEGRATED CONTEXT — spontaneous, not staged.
-5. HUMAN ENERGY — subtle, truthful emotion and connection.
+TYPOGRAPHY
+- Use modern sans-serif (Inter / Helvetica / Roboto / SF Pro).
+- Hierarchy: Headline (48–60px), Subheadline (22–26px), Body (16–18px).
+- Strong contrast; crisp readability.
 
-SCENE GUIDELINES
+COLOR PALETTE
+- Derived from the product + clean neutrals.
+- One strategic accent color for clarity and CTAs.
 
-Lighting: use the most natural option suitable for the chosen lifestyle mood.
-Texture: tactile and sensory.
-Depth: choose shallow focus for intimacy or wide depth for expansiveness — whichever fits the product.
-Composition: asymmetrical balance, natural framing.
-Avoid: flat tones, harsh filters, heavy stylization, or digital over-editing.
+GRAPHIC ELEMENTS
+- Minimal icons, thin dividers, subtle arrows.
+- Flat or semi-flat style only.
 
-CATEGORY-BASED VISUAL REFERENCES (auto-select based on image):
-- Wellness → serene space, calm morning, mindfulness.
-- Adventure → outdoor movement, golden light, vastness.
-- Luxury → minimal elegance, soft light, refinement.
-- Creativity → studio warmth, expressive realism.
-- Sustainability → nature harmony, eco materials, balance.
-- Mindfulness → soft focus, inner calm, simplicity.
+LIGHTING & EXECUTION
+- Photorealistic lighting (35–50mm perspective).
+- Correct shadows, reflections, realistic textures.
+- No CGI look, no surreal flares, no artificial glow.
 
-FINAL IMAGE REQUIREMENTS
+---------------------------------------------------
+STORYTELLING ELEMENT
+Visually communicate why the product is worth buying by emphasizing:
+- Trust
+- Clarity
+- Emotional resonance
+- Demonstrated usefulness
+- Realistic environment when appropriate
 
-- Generate one high-quality, realistic, photographic lifestyle image.
-- Integrate the reference subject seamlessly into a natural, believable setting.
-- Maintain complete subject visibility and accuracy.
-- Evoke emotional transformation — from tension to peace, or longing to empowerment.
-- Use natural light and organic tone to tell a visual story.
-- No text, branding, or graphic overlays.
-- Image must feel editorial and emotionally grounded — like a premium lifestyle magazine moment.
-- Express transformation, belonging, and purpose through authenticity, light, and human emotion.
+The viewer should think:
+"This looks real, premium, and worth buying."
 
-The final image should look real, emotionally resonant, and aspirational — inspiring the viewer to feel:
-“This could be me, living fully, naturally, beautifully.”
+---------------------------------------------------
+REALISM & ACCURACY VALIDATION
+Check:
+- No changes to product design or color.
+- Lighting direction consistent.
+- Realistic shadows.
+- Text legible at thumbnail view.
+- No distortion or oversaturation.
+- Feels like a modern premium ecommerce graphic.
 
+---------------------------------------------------
+FINAL OUTPUT REQUIREMENTS
+- Generate ONE 4K or 8K infographic image.
+- Orientation: 4:5 or 16:9.
+- Photorealistic, premium, clean, credible.
+- No variations, no filters, no CGI artifacts.
+- No added props that alter product meaning.
+
+---------------------------------------------------
+CREATIVE GOAL
+Produce a conversion-optimized, photorealistic infographic that blends:
+- Realism
+- Trust
+- Clarity
+- Emotional appeal
+- Premium branding
+- 100% accuracy
+
+The viewer should instantly feel:
+“This is real, premium, trustworthy — and exactly what I need.”
 """
 
 PROMPT_TEMPLATE = PromptTemplate.from_template(
@@ -1250,8 +1267,8 @@ def update_status_text(value: str) -> None:
 
 
 def main() -> None:
-    st.set_page_config(page_title="Lifestyle Product Image Generator", layout="wide")
-    st.markdown("#  Lifestyle Product Image Generator & Feedback (S3 Storage)")
+    st.set_page_config(page_title="Infographics Product Image Generator", layout="wide")
+    st.markdown("#  Infographics Product Image Generator & Feedback (S3 Storage)")
 
     if "generation" not in st.session_state:
         st.session_state["generation"] = None
@@ -1274,7 +1291,7 @@ def main() -> None:
         if use_custom_category:
             custom_cat_value = st.text_input(f"Custom Category (if {CUSTOM_CATEGORY_OPTION})", key="custom_category")
         description = st.text_area("Description", key="description_text", height=80)
-        submitted = st.form_submit_button(" Generate Lifestyle Images")
+        submitted = st.form_submit_button(" Generate Infographics")
 
     if submitted:
         collected: List[Image.Image] = []
