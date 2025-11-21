@@ -418,6 +418,23 @@ MODELS = [
     "seededit-3-0-i2i-250628",
 ]
 
+# Optional per-model prompt overrides. Leave entries empty or remove keys to use the main prompt.
+MODEL_PROMPT_OVERRIDES: Dict[str, str] = {}
+# Uncomment and set any of the lines below to override that model's prompt:
+# MODEL_PROMPT_OVERRIDES["gpt-image-1"] = "Custom prompt for gpt-image-1"
+# MODEL_PROMPT_OVERRIDES["gpt-image-1-mini"] = "Custom prompt for gpt-image-1-mini"
+# MODEL_PROMPT_OVERRIDES["gemini-2.5-flash-image"] = "Custom prompt for gemini-2.5-flash-image"
+# MODEL_PROMPT_OVERRIDES["gemini-3-pro-image-preview"] = "Custom prompt for gemini-3-pro-image-preview"
+# MODEL_PROMPT_OVERRIDES["qwen/qwen-image-edit"] = "Custom prompt for qwen/qwen-image-edit"
+# MODEL_PROMPT_OVERRIDES["qwen/qwen-image-edit-plus"] = "Custom prompt for qwen/qwen-image-edit-plus"
+# MODEL_PROMPT_OVERRIDES["black-forest-labs/flux-kontext-max"] = "Custom prompt for black-forest-labs/flux-kontext-max"
+# MODEL_PROMPT_OVERRIDES["black-forest-labs/flux-kontext-pro"] = "Custom prompt for black-forest-labs/flux-kontext-pro"
+# MODEL_PROMPT_OVERRIDES["black-forest-labs/flux-pro"] = "Custom prompt for black-forest-labs/flux-pro"
+# MODEL_PROMPT_OVERRIDES["ideogram-ai/ideogram-v3-turbo"] = "Custom prompt for ideogram-ai/ideogram-v3-turbo"
+# MODEL_PROMPT_OVERRIDES["qwen/qwen-image"] = "Custom prompt for qwen/qwen-image"
+# MODEL_PROMPT_OVERRIDES["seedream-4"] = "Custom prompt for seedream-4"
+# MODEL_PROMPT_OVERRIDES["seededit-3-0-i2i-250628"] = "Custom prompt for seededit-3-0-i2i-250628"
+
 MAX_REFERENCE_IMAGES = 3
 CUSTOM_CATEGORY_OPTION = "Others"
 categories_list = [
@@ -1235,10 +1252,12 @@ async def generate_for_model(
     input_download_link: Optional[str],
     input_view_link: Optional[str],
     output_index: int = 1,
+    model_prompts: Optional[Dict[str, str]] = None,
 ) -> Optional[Image.Image]:
     template = PROMPT_TEMPLATE_SEEDREAM if model_name == "seedream-4" else PROMPT_TEMPLATE
-    prompt = template.format(category=category, description=description)
-    prompt = clamp_prompt_length(prompt)
+    base_prompt = template.format(category=category, description=description)
+    custom_prompt = (model_prompts or {}).get(model_name)
+    prompt = clamp_prompt_length(custom_prompt if custom_prompt else base_prompt)
     generator = MODEL_GENERATORS.get(model_name)
     if not generator:
         raise ValueError(f"Unsupported model: {model_name}")
@@ -1286,6 +1305,7 @@ async def generate_all(
     description: str,
     image: Optional[Image.Image],
     output_index: int = 1,
+    model_prompts: Optional[Dict[str, str]] = None,
 ) -> List[Optional[Image.Image]]:
     ts = datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d_%H-%M-%S")
     pil_image = to_pil_image(image)
@@ -1302,6 +1322,7 @@ async def generate_all(
             input_download_link,
             input_view_link,
             output_index,
+            model_prompts=model_prompts,
         )
         for model in MODELS
     ]
@@ -1321,15 +1342,16 @@ def generate_sync(
     description: str,
     image: Any,
     output_index: int = 1,
+    model_prompts: Optional[Dict[str, str]] = None,
 ) -> List[Optional[Image.Image]]:
     with GENERATION_LOCK:
         try:
-            return asyncio.run(generate_all(category, description, image, output_index))
+            return asyncio.run(generate_all(category, description, image, output_index, model_prompts=model_prompts))
         except RuntimeError as exc:
             message = str(exc).lower()
             if "asyncio.run()" in message or "event loop is already running" in message:
                 def _runner() -> List[Optional[Image.Image]]:
-                    return asyncio.run(generate_all(category, description, image, output_index))
+                    return asyncio.run(generate_all(category, description, image, output_index, model_prompts=model_prompts))
 
                 with ThreadPoolExecutor(max_workers=1) as executor:
                     future = executor.submit(_runner)
@@ -1436,6 +1458,7 @@ def main() -> None:
         )
         use_custom_category = category in CUSTOM_CATEGORY_MATCHES
         description = st.text_area("Description", key="description_text", height=80)
+
         submitted = st.form_submit_button(" Generate Lifestyle Images")
 
     if submitted:
@@ -1446,6 +1469,12 @@ def main() -> None:
                 img = download_image_from_url(url.strip())
             if img is not None:
                 collected.append(img)
+
+        model_prompts = {
+            name: val.strip()
+            for name, val in MODEL_PROMPT_OVERRIDES.items()
+            if val and val.strip()
+        }
 
         final_category = (
             custom_cat_value.strip()
@@ -1462,7 +1491,13 @@ def main() -> None:
                 update_status_text(" Unable to prepare the reference preview from the provided inputs.")
                 st.error(f"Unable to prepare the reference preview: {exc}")
             else:
-                generated_images = generate_sync(final_category, description, reference_image, output_index=1)
+                generated_images = generate_sync(
+                    final_category,
+                    description,
+                    reference_image,
+                    output_index=1,
+                    model_prompts=model_prompts or None,
+                )
                 produced_outputs = sum(1 for img in generated_images if img is not None)
                 status_msg = (
                     f" Combined {len(collected)} reference image(s) & generated {produced_outputs} outputs."
