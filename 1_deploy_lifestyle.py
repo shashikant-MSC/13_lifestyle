@@ -93,6 +93,17 @@ else:
 
     gclient = _GenAIFallbackClient()
 
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN") or os.environ.get("replicate")
+REPLICATE_MODEL_IDS = {
+    "qwen/qwen-image-edit": "qwen/qwen-image-edit",
+    "qwen/qwen-image-edit-plus": "qwen/qwen-image-edit-plus",
+    "black-forest-labs/flux-pro": "black-forest-labs/flux-pro",
+    "black-forest-labs/flux-kontext-max": "black-forest-labs/flux-kontext-max",
+    "black-forest-labs/flux-kontext-pro": "black-forest-labs/flux-kontext-pro",
+    "ideogram-ai/ideogram-v3-turbo": "ideogram-ai/ideogram-v3-turbo",
+    "qwen/qwen-image": "qwen/qwen-image",
+}
+
 ARK_API_KEY = os.environ.get("ARK_API_KEY") or None
 
 SEEDREAM_ENDPOINT = "https://ark.ap-southeast.bytepluses.com/api/v3/images/generate"
@@ -395,6 +406,14 @@ MODELS = [
     "gpt-image-1",
     "gpt-image-1-mini",
     "gemini-2.5-flash-image",
+    "gemini-3-pro-image-preview",
+    "qwen/qwen-image-edit",
+    "qwen/qwen-image-edit-plus",
+    "black-forest-labs/flux-kontext-max",
+    "black-forest-labs/flux-kontext-pro",
+    "black-forest-labs/flux-pro",
+    "ideogram-ai/ideogram-v3-turbo",
+    "qwen/qwen-image",
     "seedream-4",
     "seededit-3-0-i2i-250628",
 ]
@@ -959,6 +978,31 @@ def download_image_from_url(url: str) -> Optional[Image.Image]:
         return None
 
 
+def _extract_first_image_from_output(output: Any) -> Optional[Image.Image]:
+    """Return the first usable image from Replicate outputs (urls, base64, nested)."""
+    if output is None:
+        return None
+    if isinstance(output, dict):
+        url = output.get("url")
+        if url:
+            img = download_image_from_url(url)
+            if img:
+                return img
+        data = output.get("b64_json") or output.get("base64")
+        if data:
+            img = image_from_base64(data)
+            if img:
+                return img
+        return _extract_first_image_from_output(output.get("output"))
+    if isinstance(output, (list, tuple)):
+        for item in output:
+            img = _extract_first_image_from_output(item)
+            if img:
+                return img
+        return None
+    if isinstance(output, str):
+        return download_image_from_url(output) or image_from_base64(output)
+    return None
 
 
 async def generate_with_openai_image_model(
@@ -1058,10 +1102,125 @@ async def generate_with_seededit_model(
     )
 
 
+async def generate_with_replicate_model(
+    model_name: str,
+    prompt: str,
+    image: Optional[Image.Image],
+    input_link: Optional[str],
+) -> Optional[Image.Image]:
+    token = REPLICATE_API_TOKEN
+    if not token:
+        print(f"[info] Replicate token missing; skipping {model_name}.")
+        return None
+    prepared_image, _ = ensure_aspect_ratio_bounds(image)
+    reference_url = build_reference_url(prepared_image, input_link)
+    image_arg = None
+    if prepared_image is not None:
+        image_arg = pil_to_data_uri(prepared_image)
+    elif reference_url:
+        image_arg = reference_url
+
+    model_id = REPLICATE_MODEL_IDS.get(model_name, model_name)
+
+    def _build_input() -> Optional[Dict[str, Any]]:
+        if model_name == "qwen/qwen-image-edit-plus":
+            imgs = []
+            if image_arg:
+                imgs = [image_arg, image_arg]
+            elif reference_url:
+                imgs = [reference_url, reference_url]
+            if not imgs:
+                print(f"[warn] {model_name} requires two images; none provided.")
+                return None
+            return {"image": imgs, "prompt": prompt}
+        if model_name == "qwen/qwen-image-edit":
+            img = image_arg or reference_url
+            if not img:
+                print(f"[warn] {model_name} requires an image; none provided.")
+                return None
+            return {"image": img, "prompt": prompt, "output_quality": 80}
+        if model_name in {"black-forest-labs/flux-kontext-max", "black-forest-labs/flux-kontext-pro"}:
+            img = image_arg or reference_url
+            if not img:
+                print(f"[warn] {model_name} requires an image; none provided.")
+                return None
+            return {"prompt": prompt, "input_image": img, "output_format": "jpg"}
+        if model_name == "black-forest-labs/flux-1.1-pro":
+            return {"prompt": prompt, "prompt_upsampling": True}
+        if model_name == "black-forest-labs/flux-1.1-pro-ultra":
+            return {"prompt": prompt, "aspect_ratio": "3:2"}
+        if model_name == "black-forest-labs/flux-pro":
+            return {"prompt": prompt}
+        if model_name == "ideogram-ai/ideogram-v3-turbo":
+            return {"prompt": prompt, "aspect_ratio": "3:2"}
+        if model_name == "qwen/qwen-image":
+            return {"prompt": prompt, "guidance": 4, "num_inference_steps": 30}
+        payload = {"prompt": prompt}
+        if image_arg:
+            payload["image"] = image_arg
+        return payload
+
+    payload_input = _build_input()
+    if payload_input is None:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+    create_url = f"https://api.replicate.com/v1/models/{model_id}/predictions"
+
+    def _call():
+        try:
+            resp = requests.post(create_url, json={"input": payload_input}, headers=headers, timeout=30)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[warn] Replicate request failed for {model_name}:", exc)
+            return None
+        if resp.status_code not in (200, 201, 202):
+            print(f"[warn] Replicate {model_name} HTTP {resp.status_code}: {resp.text}")
+            return None
+        data = resp.json()
+        status = data.get("status")
+        image_out = _extract_first_image_from_output(data.get("output"))
+        poll_url = data.get("urls", {}).get("get")
+        pred_id = data.get("id")
+        if not poll_url and pred_id:
+            poll_url = f"https://api.replicate.com/v1/predictions/{pred_id}"
+        terminal = {"succeeded", "failed", "canceled"}
+        while image_out is None and status not in terminal and poll_url:
+            try:
+                poll_resp = requests.get(poll_url, headers=headers, timeout=30)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[warn] Replicate poll failed for {model_name}:", exc)
+                break
+            if poll_resp.status_code not in (200, 201, 202):
+                print(f"[warn] Replicate poll HTTP {poll_resp.status_code}: {poll_resp.text}")
+                break
+            payload = poll_resp.json()
+            status = payload.get("status", status)
+            image_out = _extract_first_image_from_output(payload.get("output"))
+            if image_out or status in terminal:
+                break
+            time.sleep(2)
+        if image_out is None:
+            print(f"[warn] Replicate {model_name} returned no image (status={status}).")
+        return image_out
+
+    return await run_blocking(_call)
+
+
 MODEL_GENERATORS: Dict[str, Any] = {
     "gpt-image-1": generate_with_openai_image_model,
     "gpt-image-1-mini": generate_with_openai_image_model,
     "gemini-2.5-flash-image": generate_with_gemini_image_model,
+    "gemini-3-pro-image-preview": generate_with_gemini_image_model,
+    "qwen/qwen-image-edit": generate_with_replicate_model,
+    "qwen/qwen-image-edit-plus": generate_with_replicate_model,
+    "black-forest-labs/flux-kontext-max": generate_with_replicate_model,
+    "black-forest-labs/flux-kontext-pro": generate_with_replicate_model,
+    "black-forest-labs/flux-pro": generate_with_replicate_model,
+    "ideogram-ai/ideogram-v3-turbo": generate_with_replicate_model,
+    "qwen/qwen-image": generate_with_replicate_model,
     "seedream-4": generate_with_seedream_model,
     "seededit-3-0-i2i-250628": generate_with_seededit_model,
 }
@@ -1089,7 +1248,8 @@ async def generate_for_model(
         print(f"[warn] {model_name} returned no image.")
         return None
 
-    temp_path = Path(tempfile.gettempdir()) / f"{ts}_{model_name}_gen{output_index}.jpg"
+    safe_model_name = model_name.replace("/", "_").replace(":", "-")
+    temp_path = Path(tempfile.gettempdir()) / f"{ts}_{safe_model_name}_gen{output_index}.jpg"
     out_img.save(temp_path)
     out_download_link, out_view_link = upload_image_to_s3(temp_path, S3_OUTPUT_PREFIX)
     temp_path.unlink(missing_ok=True)
