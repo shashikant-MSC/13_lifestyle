@@ -1431,6 +1431,16 @@ def update_status_text(value: str) -> None:
     st.session_state["status_text"] = value
 
 
+def reset_session_state() -> None:
+    """Clear all Streamlit session state and rerun to start fresh."""
+    for key in list(st.session_state.keys()):
+        del st.session_state[key]
+    try:
+        st.experimental_rerun()  # Streamlit <=1.31
+    except AttributeError:
+        st.rerun()  # Streamlit >=1.32
+
+
 def main() -> None:
     st.set_page_config(page_title="Lifestyle Product Image Generator", layout="wide")
     st.markdown("#  Lifestyle Product Image Generator & Feedback (S3 Storage)")
@@ -1439,6 +1449,9 @@ def main() -> None:
         st.session_state["generation"] = None
     if "status_text" not in st.session_state:
         st.session_state["status_text"] = "Ready!"
+
+    if st.button("Reset"):
+        reset_session_state()
 
     with st.form("generator_form"):
         st.write("### Reference Images")
