@@ -290,7 +290,7 @@ Use your full capability to analyze and understand the input image before creati
 Automatically select the most fitting lifestyle theme, emotional tone, environment, and visual mood **based on what is visible in the image** (product type, person, color, materials, category cues).
 Every choice — from lighting to setting — must logically and emotionally complement the reference subject.The scene created should be according to the product.
 Note to be followed strictly-(
-1-The image should show how that product is being used in real life.
+1-The image should show how that product is being used in real life.If there is a human in image then the human face should not be cropped.
 2-The scene should be right according to physics rules
 3-The image should be 100 percent right as in real world(earphone bud should be properly fixed in ears,no extra wire)
 4-Product should not change(any minute deatils should not change like logo,design,color,size(watch dial size should not be enlarged)))
